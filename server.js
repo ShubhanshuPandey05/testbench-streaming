@@ -64,7 +64,7 @@ wss.on('connection', (ws) => {
     }
 
     dgSocket = new WebSocket(
-      `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova&language=en&punctuate=true&interim_results=true&endpointing=500`,
+      `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-3&language=en&punctuate=true&interim_results=true&endpointing=500`,
       ['token', `${process.env.DEEPGRAM_API}`]
     );
 
@@ -104,6 +104,7 @@ wss.on('connection', (ws) => {
 
             // Send buffered transcripts
             if (transcriptBuffer.length > 0) {
+              // console.log(transcriptBuffer);
               ws.send(JSON.stringify({ 
                 transcript: transcriptBuffer.join(' '),
                 isFinal: true 
