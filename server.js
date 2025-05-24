@@ -1,7 +1,7 @@
 const { spawn } = require('child_process');
 const WebSocket = require('ws');
 require('dotenv').config();
-const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk')
+const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 // const Speaker = require('speaker');
 // const speaker = new Speaker({
 //   channels: 1,
@@ -17,7 +17,7 @@ const pythonPath = 'C:/Users/shubh/miniconda3/envs/vad-env/python.exe';
 // Launch Python VAD script
 const vad = spawn(pythonPath, ['vad.py']);
 
-// Spawn FFmpeg to decode audio to PCM
+// Spawn FFmpeg to decode audio to PCM with optimized settings
 const ffmpeg = spawn('ffmpeg', [
   '-loglevel', 'quiet',
   '-i', 'pipe:0',        // input from stdin
@@ -25,10 +25,12 @@ const ffmpeg = spawn('ffmpeg', [
   '-acodec', 'pcm_s16le',
   '-ac', '1',            // mono
   '-ar', '16000',        // 16kHz
+  '-threads', '0',       // use all available threads
+  '-af', 'highpass=f=200,lowpass=f=3000', // basic noise filtering
   'pipe:1'               // output to stdout
 ]);
 
-const deepgram = createClient(process.env.DEEPGRAM_API)
+const deepgram = createClient(process.env.DEEPGRAM_API);
 
 // Pipe FFmpeg output to Python VAD input
 ffmpeg.stdout.pipe(vad.stdin);
@@ -51,6 +53,10 @@ wss.on('connection', (ws) => {
   let reconnectAttempts = 0;
   const MAX_RECONNECT_ATTEMPTS = 5;
   const RECONNECT_DELAY = 1000; // 1 second
+  let lastTranscript = '';
+  let transcriptBuffer = [];
+  let silenceTimer = null;
+  const SILENCE_THRESHOLD = 1000; // 1 second of silence
 
   const connectToDeepgram = () => {
     if (dgSocket) {
@@ -58,7 +64,7 @@ wss.on('connection', (ws) => {
     }
 
     dgSocket = new WebSocket(
-      `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1`,
+      `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova&language=en&punctuate=true&interim_results=true&endpointing=500`,
       ['token', `${process.env.DEEPGRAM_API}`]
     );
 
@@ -72,9 +78,49 @@ wss.on('connection', (ws) => {
         const received = JSON.parse(data);
         if (received.channel?.alternatives?.[0]?.transcript) {
           const transcript = received.channel.alternatives[0].transcript;
-          if (received.is_final && received.speech_final) {
-            console.log('Final transcript:', transcript);
-            ws.send(JSON.stringify({ transcript }));
+          
+          // Handle interim results
+          if (!received.is_final) {
+            ws.send(JSON.stringify({ 
+              transcript: transcript,
+              isInterim: true 
+            }));
+            return;
+          }
+
+          // Handle final results
+          if (received.is_final) {
+            // Clear silence timer when we get speech
+            if (silenceTimer) {
+              clearTimeout(silenceTimer);
+              silenceTimer = null;
+            }
+
+            // Add to buffer if different from last transcript
+            if (transcript !== lastTranscript) {
+              transcriptBuffer.push(transcript);
+              lastTranscript = transcript;
+            }
+
+            // Send buffered transcripts
+            if (transcriptBuffer.length > 0) {
+              ws.send(JSON.stringify({ 
+                transcript: transcriptBuffer.join(' '),
+                isFinal: true 
+              }));
+              transcriptBuffer = [];
+            }
+
+            // Start silence timer
+            silenceTimer = setTimeout(() => {
+              if (transcriptBuffer.length > 0) {
+                ws.send(JSON.stringify({ 
+                  transcript: transcriptBuffer.join(' '),
+                  isFinal: true 
+                }));
+                transcriptBuffer = [];
+              }
+            }, SILENCE_THRESHOLD);
           }
         } else if (received.type === 'Metadata') {
           console.log('[Metadata]', received);
@@ -111,6 +157,7 @@ wss.on('connection', (ws) => {
 
   // Collect VAD output and send to Deepgram in chunks
   let deepgramBuffer = Buffer.alloc(0);
+  const CHUNK_SIZE = 3200; // Reduced chunk size for faster processing
 
   vad.stdout.on('data', (data) => {
     try {
@@ -121,7 +168,7 @@ wss.on('connection', (ws) => {
         const audioBuffer = Buffer.from(parsed.chunk, 'hex');
         deepgramBuffer = Buffer.concat([deepgramBuffer, audioBuffer]);
 
-        if (deepgramBuffer.length >= 6400 && dgSocket?.readyState === WebSocket.OPEN) {
+        if (deepgramBuffer.length >= CHUNK_SIZE && dgSocket?.readyState === WebSocket.OPEN) {
           dgSocket.send(deepgramBuffer);
           deepgramBuffer = Buffer.alloc(0);
         }
@@ -160,6 +207,10 @@ wss.on('connection', (ws) => {
     
     if (dgSocket?.readyState === WebSocket.OPEN) {
       dgSocket.close();
+    }
+
+    if (silenceTimer) {
+      clearTimeout(silenceTimer);
     }
   };
 

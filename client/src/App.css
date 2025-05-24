@@ -168,6 +168,12 @@ button:disabled {
   font-weight: 600;
 }
 
+.interim-text {
+  color: #666;
+  font-style: italic;
+  opacity: 0.7;
+}
+
 .transcript {
   min-height: 200px;
   max-height: 400px;
@@ -180,6 +186,7 @@ button:disabled {
   line-height: 1.5;
   color: #333;
   font-size: 1.1rem;
+  scroll-behavior: smooth;
 }
 
 .transcript::-webkit-scrollbar {
