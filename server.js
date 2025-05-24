@@ -2,6 +2,7 @@ const { spawn } = require('child_process');
 const WebSocket = require('ws');
 require('dotenv').config();
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
+const { PollyClient, SynthesizeSpeechCommand } = require("@aws-sdk/client-polly");
 // const Speaker = require('speaker');
 // const speaker = new Speaker({
 //   channels: 1,
@@ -11,6 +12,48 @@ const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 
 const wss = new WebSocket.Server({ port: 5001 });
 console.log("✅ WebSocket server started on ws://localhost:5001");
+const polly = new PollyClient({
+  region: "us-east-1",
+  credentials: {
+    accessKeyId: `${process.env.accessKeyId}`,
+    secretAccessKey: `${process.env.secretAccessKey}`,
+  },
+});
+
+// Latency tracking
+const latencyStats = {
+  totalLatency: 0,
+  count: 0,
+  minLatency: Infinity,
+  maxLatency: 0,
+  lastUpdate: Date.now()
+};
+
+const updateLatencyStats = (latency) => {
+  latencyStats.totalLatency += latency;
+  latencyStats.count++;
+  latencyStats.minLatency = Math.min(latencyStats.minLatency, latency);
+  latencyStats.maxLatency = Math.max(latencyStats.maxLatency, latency);
+
+  // Log stats every 5 seconds
+  const now = Date.now();
+  if (now - latencyStats.lastUpdate >= 5000) {
+    const avgLatency = latencyStats.totalLatency / latencyStats.count;
+    console.log('\n=== Latency Statistics ===');
+    console.log(`Average Latency: ${avgLatency.toFixed(2)}ms`);
+    console.log(`Min Latency: ${latencyStats.minLatency.toFixed(2)}ms`);
+    console.log(`Max Latency: ${latencyStats.maxLatency.toFixed(2)}ms`);
+    console.log(`Total Samples: ${latencyStats.count}`);
+    console.log('========================\n');
+
+    // Reset stats
+    latencyStats.totalLatency = 0;
+    latencyStats.count = 0;
+    latencyStats.minLatency = Infinity;
+    latencyStats.maxLatency = 0;
+    latencyStats.lastUpdate = now;
+  }
+};
 
 const pythonPath = 'C:/Users/shubh/miniconda3/envs/vad-env/python.exe';
 
@@ -57,6 +100,7 @@ wss.on('connection', (ws) => {
   let transcriptBuffer = [];
   let silenceTimer = null;
   const SILENCE_THRESHOLD = 1000; // 1 second of silence
+  let audioStartTime = null; // Add this line for latency tracking
 
   const connectToDeepgram = () => {
     if (dgSocket) {
@@ -79,12 +123,35 @@ wss.on('connection', (ws) => {
         if (received.channel?.alternatives?.[0]?.transcript) {
           const transcript = received.channel.alternatives[0].transcript;
           
+          // Calculate latency
+          if (audioStartTime) {
+            const latency = Date.now() - audioStartTime;
+            updateLatencyStats(latency);
+          }
+          
           // Handle interim results
           if (!received.is_final) {
             ws.send(JSON.stringify({ 
               transcript: transcript,
               isInterim: true 
             }));
+
+            // Synthesize speech for interim results
+            synthesizeSpeech(transcript)
+              .then(audioBuffer => {
+                ws.send(JSON.stringify({
+                  type: 'tts',
+                  audio: audioBuffer.toString('base64'),
+                  isInterim: true
+                }));
+              })
+              .catch(err => {
+                console.error('TTS Error:', err);
+                ws.send(JSON.stringify({
+                  type: 'tts_error',
+                  error: 'Failed to synthesize speech'
+                }));
+              });
             return;
           }
 
@@ -102,23 +169,60 @@ wss.on('connection', (ws) => {
               lastTranscript = transcript;
             }
 
-            // Send buffered transcripts
+            // Send buffered transcripts and synthesize speech
             if (transcriptBuffer.length > 0) {
-              // console.log(transcriptBuffer);
+              const finalTranscript = transcriptBuffer.join(' ');
               ws.send(JSON.stringify({ 
-                transcript: transcriptBuffer.join(' '),
+                transcript: finalTranscript,
                 isFinal: true 
               }));
+              
+              // Synthesize speech for the final transcript
+              synthesizeSpeech(finalTranscript)
+                .then(audioBuffer => {
+                  ws.send(JSON.stringify({
+                    type: 'tts',
+                    audio: audioBuffer.toString('base64'),
+                    isFinal: true
+                  }));
+                })
+                .catch(err => {
+                  console.error('TTS Error:', err);
+                  ws.send(JSON.stringify({
+                    type: 'tts_error',
+                    error: 'Failed to synthesize speech'
+                  }));
+                });
+                
               transcriptBuffer = [];
             }
 
             // Start silence timer
             silenceTimer = setTimeout(() => {
               if (transcriptBuffer.length > 0) {
+                const finalTranscript = transcriptBuffer.join(' ');
                 ws.send(JSON.stringify({ 
-                  transcript: transcriptBuffer.join(' '),
+                  transcript: finalTranscript,
                   isFinal: true 
                 }));
+                
+                // Synthesize speech for the final transcript
+                synthesizeSpeech(finalTranscript)
+                  .then(audioBuffer => {
+                    ws.send(JSON.stringify({
+                      type: 'tts',
+                      audio: audioBuffer.toString('base64'),
+                      isFinal: true
+                    }));
+                  })
+                  .catch(err => {
+                    console.error('TTS Error:', err);
+                    ws.send(JSON.stringify({
+                      type: 'tts_error',
+                      error: 'Failed to synthesize speech'
+                    }));
+                  });
+                  
                 transcriptBuffer = [];
               }
             }, SILENCE_THRESHOLD);
@@ -153,6 +257,28 @@ wss.on('connection', (ws) => {
     }
   };
 
+  const synthesizeSpeech = async (text) => {
+    const params = {
+      Text: text,
+      VoiceId: "Joanna",
+      OutputFormat: "mp3"
+    };
+    try {
+      const command = new SynthesizeSpeechCommand(params);
+      const data = await polly.send(command);
+
+      if (data.AudioStream) {
+        const audioBuffer = Buffer.from(await data.AudioStream.transformToByteArray());
+        return audioBuffer;
+      } else {
+        throw new Error("AudioStream not found in the response.");
+      }
+    } catch (err) {
+      console.error("Error synthesizing speech:", err);
+      throw err;
+    }
+  };
+
   // Initial connection to Deepgram
   connectToDeepgram();
 
@@ -170,6 +296,7 @@ wss.on('connection', (ws) => {
         deepgramBuffer = Buffer.concat([deepgramBuffer, audioBuffer]);
 
         if (deepgramBuffer.length >= CHUNK_SIZE && dgSocket?.readyState === WebSocket.OPEN) {
+          audioStartTime = Date.now(); // Add this line to record start time
           dgSocket.send(deepgramBuffer);
           deepgramBuffer = Buffer.alloc(0);
         }
@@ -205,7 +332,7 @@ wss.on('connection', (ws) => {
     } catch (e) {
       console.error('Error closing FFmpeg stdin:', e);
     }
-    
+
     if (dgSocket?.readyState === WebSocket.OPEN) {
       dgSocket.close();
     }

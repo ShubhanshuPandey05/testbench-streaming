@@ -14,6 +14,11 @@ const App = () => {
   const analyserRef = useRef(null);
   const animationFrameRef = useRef(null);
   const transcriptEndRef = useRef(null);
+  const audioQueueRef = useRef([]);
+  const isPlayingRef = useRef(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const lastInterimTimeRef = useRef(0);
+  const INTERIM_THRESHOLD = 500; // Minimum time between interim audio playback
 
   useEffect(() => {
     return () => {
@@ -61,6 +66,58 @@ const App = () => {
     updateAudioLevel();
   };
 
+  const playNextAudio = async () => {
+    if (audioQueueRef.current.length === 0 || isPlayingRef.current) {
+      return;
+    }
+
+    isPlayingRef.current = true;
+    const { audioData, isInterim } = audioQueueRef.current.shift();
+    
+    try {
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      
+      const audioBuffer = await audioContextRef.current.decodeAudioData(audioData);
+      const source = audioContextRef.current.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioContextRef.current.destination);
+      
+      source.onended = () => {
+        isPlayingRef.current = false;
+        setIsPlaying(false);
+        playNextAudio();
+      };
+      
+      setIsPlaying(true);
+      source.start(0);
+    } catch (err) {
+      console.error('Error playing audio:', err);
+      isPlayingRef.current = false;
+      setIsPlaying(false);
+      playNextAudio();
+    }
+  };
+
+  const queueAudio = (audioData, isInterim) => {
+    const now = Date.now();
+    
+    // For interim results, check if enough time has passed since last interim
+    if (isInterim && now - lastInterimTimeRef.current < INTERIM_THRESHOLD) {
+      return;
+    }
+    
+    if (isInterim) {
+      lastInterimTimeRef.current = now;
+    }
+    
+    audioQueueRef.current.push({ audioData, isInterim });
+    if (!isPlayingRef.current) {
+      playNextAudio();
+    }
+  };
+
   const startRecording = async () => {
     try {
       setError(null);
@@ -95,7 +152,20 @@ const App = () => {
       wsRef.current.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          if (data.transcript) {
+          
+          if (data.type === 'tts') {
+            // Convert base64 to ArrayBuffer
+            const binaryString = window.atob(data.audio);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+            }
+            
+            // Queue the audio with its type (interim or final)
+            queueAudio(bytes.buffer, data.isInterim);
+          } else if (data.type === 'tts_error') {
+            console.error('TTS Error:', data.error);
+          } else if (data.transcript) {
             if (data.isInterim) {
               setInterimTranscript(data.transcript);
             } else {
@@ -153,6 +223,7 @@ const App = () => {
           {isConnected ? 'Connected' : 'Disconnected'}
         </div>
         {error && <div className="error-message">{error}</div>}
+        {isPlaying && <div className="playing-status">Playing back...</div>}
       </div>
 
       <div className="audio-visualizer">
