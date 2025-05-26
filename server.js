@@ -27,6 +27,12 @@ const latencyStats = {
   lastUpdate: Date.now()
 };
 
+const latency = {
+  llm: 0,
+  stt: 0,
+  tts: 0,
+};
+
 const updateLatencyStats = (latency) => {
   latencyStats.totalLatency += latency;
   latencyStats.count++;
@@ -42,7 +48,7 @@ const updateLatencyStats = (latency) => {
     console.log(`Min Latency: ${latencyStats.minLatency.toFixed(2)}ms`);
     console.log(`Max Latency: ${latencyStats.maxLatency.toFixed(2)}ms`);
     console.log(`Total Samples: ${latencyStats.count}`);
-    console.log('========================\n');
+    console.log('==========================\n');
 
     // Reset stats
     latencyStats.totalLatency = 0;
@@ -102,7 +108,7 @@ wss.on('connection', (ws) => {
   let lastInterimTime = Date.now();
   let isSpeaking = false;
   const INTERIM_CONFIDENCE_THRESHOLD = 0.7;
-  const INTERIM_TIME_THRESHOLD = 50;
+  const INTERIM_TIME_THRESHOLD = 10;
   let lastInterimTranscript = '';
   let interimResultsBuffer = [];
 
@@ -183,17 +189,28 @@ wss.on('connection', (ws) => {
                 isFinal: true
               }));
 
+
+
+
+
+
+
+
+
+
               // Process final transcript through LLM and then TTS
               try {
                 const processedText = await processInput(finalTranscript);
                 console.log('LLM processed text:', processedText);
 
+                // await synthesizeSpeech(processedText, ws);
                 const audioBuffer = await synthesizeSpeech(processedText);
                 if (audioBuffer) {
                   ws.send(JSON.stringify({
                     type: 'tts',
                     audio: audioBuffer.toString('base64'),
-                    isFinal: true
+                    isFinal: true,
+                    latency: latency.tts
                   }));
                 }
               } catch (err) {
@@ -203,6 +220,17 @@ wss.on('connection', (ws) => {
                   error: 'Failed to process or synthesize speech'
                 }));
               }
+
+
+
+
+
+
+
+
+
+
+
 
               transcriptBuffer = [];
             }
@@ -242,7 +270,7 @@ wss.on('connection', (ws) => {
 
   // Collect VAD output and send to Deepgram in chunks
   let deepgramBuffer = Buffer.alloc(0);
-  const CHUNK_SIZE = 1600; // Reduced chunk size for faster processing
+  const CHUNK_SIZE = 6400; // Reduced chunk size for faster processing
   let isSpeechActive = false;
 
   vad.stdout.on('data', (data) => {
@@ -326,23 +354,28 @@ wss.on('connection', (ws) => {
   async function processInput(input) {
     try {
       // console.log('Processing input through LLM:', input);
+      let latency = Date.now();
       const response = await client.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           {
             role: "system",
-            content: "You are a helpful assistant. Keep responses concise and natural."
+            content: "You are a helpful assistant. Keep responses concise and natural. Keep responses short and concise."
           },
           {
             role: "user",
             content: input
           }
         ],
-        max_tokens: 150
+        max_tokens: 30,
+        temperature: 0.1,
       });
 
       const processedText = response.choices[0].message.content;
-      console.log('LLM processed text:', processedText);
+      latency = Date.now() - latency;
+      console.log('LLM latency:', latency);
+      latency.llm = latency;
+      // console.log('LLM processed text:', processedText);
       return processedText;
     } catch (error) {
       console.error('Error processing input through LLM:', error);
@@ -364,8 +397,12 @@ wss.on('connection', (ws) => {
     };
 
     try {
+      let latency = Date.now();
       const command = new SynthesizeSpeechCommand(params);
       const data = await polly.send(command);
+      latency = Date.now() - latency;
+      console.log('TTS latency:', latency);
+      latency.tts = latency;
 
       if (data.AudioStream) {
         const audioBuffer = Buffer.from(await data.AudioStream.transformToByteArray());
@@ -378,4 +415,27 @@ wss.on('connection', (ws) => {
       throw err;
     }
   };
+  // const synthesizeSpeech = async (text, ws) => {
+  //   if (!text) return;
+
+  //   const params = {
+  //     Text: text,
+  //     VoiceId: "Joanna",
+  //     OutputFormat: "mp3"
+  //   };
+
+  //   const command = new SynthesizeSpeechCommand(params);
+  //   const data = await polly.send(command);
+
+  //   if (data.AudioStream) {
+  //     // AudioStream is a readable stream
+  //     const stream = data.AudioStream;
+  //     stream.on('data', (chunk) => {
+  //       ws.send(chunk); // Send each chunk as binary data
+  //     });
+  //     stream.on('end', () => {
+  //       ws.send(JSON.stringify({ type: 'end' })); // Signal end of stream
+  //     });
+  //   }
+  // };
 });

@@ -19,6 +19,11 @@ const App = () => {
   const [isPlaying, setIsPlaying] = useState(false);
   const lastInterimTimeRef = useRef(0);
   const INTERIM_THRESHOLD = 500; // Minimum time between interim audio playback
+  const [latency, setLatency] = useState({
+    llm: 0,
+    stt: 0,
+    tts: 0
+  });
 
   useEffect(() => {
     return () => {
@@ -54,7 +59,7 @@ const App = () => {
     const source = audioContextRef.current.createMediaStreamSource(stream);
     source.connect(analyserRef.current);
     analyserRef.current.fftSize = 256;
-    
+
     const updateAudioLevel = () => {
       const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
       analyserRef.current.getByteFrequencyData(dataArray);
@@ -62,7 +67,7 @@ const App = () => {
       setAudioLevel(average);
       animationFrameRef.current = requestAnimationFrame(updateAudioLevel);
     };
-    
+
     updateAudioLevel();
   };
 
@@ -73,23 +78,23 @@ const App = () => {
 
     isPlayingRef.current = true;
     const { audioData, isInterim } = audioQueueRef.current.shift();
-    
+
     try {
       if (!audioContextRef.current) {
         audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
       }
-      
+
       const audioBuffer = await audioContextRef.current.decodeAudioData(audioData);
       const source = audioContextRef.current.createBufferSource();
       source.buffer = audioBuffer;
       source.connect(audioContextRef.current.destination);
-      
+
       source.onended = () => {
         isPlayingRef.current = false;
         setIsPlaying(false);
         playNextAudio();
       };
-      
+
       setIsPlaying(true);
       source.start(0);
     } catch (err) {
@@ -102,16 +107,16 @@ const App = () => {
 
   const queueAudio = (audioData, isInterim) => {
     const now = Date.now();
-    
+
     // For interim results, check if enough time has passed since last interim
     if (isInterim && now - lastInterimTimeRef.current < INTERIM_THRESHOLD) {
       return;
     }
-    
+
     if (isInterim) {
       lastInterimTimeRef.current = now;
     }
-    
+
     audioQueueRef.current.push({ audioData, isInterim });
     if (!isPlayingRef.current) {
       playNextAudio();
@@ -121,15 +126,15 @@ const App = () => {
   const startRecording = async () => {
     try {
       setError(null);
-      const stream = await navigator.mediaDevices.getUserMedia({ 
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true
-        } 
+        }
       });
       setupAudioAnalysis(stream);
-      
+
       wsRef.current = new WebSocket('ws://localhost:5001');
       let reconnectTimeout = null;
 
@@ -145,14 +150,14 @@ const App = () => {
           }
         };
 
-        mediaRecorderRef.current.start(100);
+        mediaRecorderRef.current.start(50);
         setRecording(true);
       };
 
       wsRef.current.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          
+
           if (data.type === 'tts') {
             // Convert base64 to ArrayBuffer
             const binaryString = window.atob(data.audio);
@@ -160,9 +165,14 @@ const App = () => {
             for (let i = 0; i < binaryString.length; i++) {
               bytes[i] = binaryString.charCodeAt(i);
             }
-            
+
             // Queue the audio with its type (interim or final)
             queueAudio(bytes.buffer, data.isInterim);
+            setLatency({
+              llm: data.latency.llm,
+              stt: data.latency.stt,
+              tts: data.latency.tts
+            });
           } else if (data.type === 'tts_error') {
             console.error('TTS Error:', data.error);
           } else if (data.transcript) {
@@ -215,6 +225,39 @@ const App = () => {
     setTranscript('');
     setInterimTranscript('');
   };
+  // const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  // let audioQueue = [];
+  // let playing = false;
+
+  // // const ws = new WebSocket('ws://localhost:5001');
+  // wsRef.binaryType = 'arraybuffer';
+
+  // wsRef.current.onmessage = async (event) => {
+  //   if (typeof event.data === 'string') {
+  //     const msg = JSON.parse(event.data);
+  //     if (msg.type === 'end') return; // End of stream
+  //   } else {
+  //     audioQueue.push(event.data);
+  //     if (!playing) playNextChunk();
+  //   }
+  // };
+
+  // async function playNextChunk() {
+  //   if (audioQueue.length === 0) {
+  //     playing = false;
+  //     return;
+  //   }
+  //   playing = true;
+  //   const chunk = audioQueue.shift();
+  //   const audioBuffer = await audioContext.decodeAudioData(chunk);
+  //   const source = audioContext.createBufferSource();
+  //   source.buffer = audioBuffer;
+  //   source.connect(audioContext.destination);
+  //   source.onended = playNextChunk;
+  //   source.start();
+  // }
+
+
 
   return (
     <div className="app-container">
@@ -227,9 +270,9 @@ const App = () => {
       </div>
 
       <div className="audio-visualizer">
-        <div 
-          className="audio-level" 
-          style={{ 
+        <div
+          className="audio-level"
+          style={{
             width: `${audioLevel}%`,
             backgroundColor: recording ? '#4CAF50' : '#9e9e9e'
           }}
@@ -259,6 +302,15 @@ const App = () => {
             <span className="interim-text">{interimTranscript}</span>
           )}
           <div ref={transcriptEndRef} />
+        </div>
+      </div>
+
+      <div className="latency-container">
+        <h2>Latency</h2>
+        <div className="latency">
+          <p>LLM: {latency.llm}ms</p>
+          <p>STT: {latency.stt}ms</p>
+          <p>TTS: {latency.tts}ms</p>
         </div>
       </div>
     </div>
