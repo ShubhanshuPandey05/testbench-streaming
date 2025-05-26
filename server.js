@@ -3,15 +3,11 @@ const WebSocket = require('ws');
 require('dotenv').config();
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 const { PollyClient, SynthesizeSpeechCommand } = require("@aws-sdk/client-polly");
-// const Speaker = require('speaker');
-// const speaker = new Speaker({
-//   channels: 1,
-//   bitDepth: 16,
-//   sampleRate: 16000
-// });
+const OpenAI = require("openai");
 
 const wss = new WebSocket.Server({ port: 5001 });
 console.log("✅ WebSocket server started on ws://localhost:5001");
+
 const polly = new PollyClient({
   region: "us-east-1",
   credentials: {
@@ -19,6 +15,8 @@ const polly = new PollyClient({
     secretAccessKey: `${process.env.secretAccessKey}`,
   },
 });
+
+const client = new OpenAI({ apiKey: process.env.OPEN_AI });
 
 // Latency tracking
 const latencyStats = {
@@ -99,8 +97,14 @@ wss.on('connection', (ws) => {
   let lastTranscript = '';
   let transcriptBuffer = [];
   let silenceTimer = null;
-  const SILENCE_THRESHOLD = 1000; // 1 second of silence
-  let audioStartTime = null; // Add this line for latency tracking
+  const SILENCE_THRESHOLD = 500; // 500ms of silence
+  let audioStartTime = null;
+  let lastInterimTime = Date.now();
+  let isSpeaking = false;
+  const INTERIM_CONFIDENCE_THRESHOLD = 0.7;
+  const INTERIM_TIME_THRESHOLD = 50;
+  let lastInterimTranscript = '';
+  let interimResultsBuffer = [];
 
   const connectToDeepgram = () => {
     if (dgSocket) {
@@ -108,7 +112,7 @@ wss.on('connection', (ws) => {
     }
 
     dgSocket = new WebSocket(
-      `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-3&language=en&punctuate=true&interim_results=true&endpointing=500`,
+      `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-3&language=en&punctuate=true&interim_results=true&endpointing=100`,
       ['token', `${process.env.DEEPGRAM_API}`]
     );
 
@@ -117,115 +121,91 @@ wss.on('connection', (ws) => {
       reconnectAttempts = 0;
     });
 
-    dgSocket.on('message', (data) => {
+    dgSocket.on('message', async (data) => {
       try {
         const received = JSON.parse(data);
         if (received.channel?.alternatives?.[0]?.transcript) {
           const transcript = received.channel.alternatives[0].transcript;
-          
+          const confidence = received.channel?.alternatives?.[0]?.confidence || 0;
+          const now = Date.now();
+
           // Calculate latency
           if (audioStartTime) {
-            const latency = Date.now() - audioStartTime;
+            const latency = now - audioStartTime;
             updateLatencyStats(latency);
           }
-          
+
           // Handle interim results
           if (!received.is_final) {
-            ws.send(JSON.stringify({ 
-              transcript: transcript,
-              isInterim: true 
-            }));
+            if (confidence >= INTERIM_CONFIDENCE_THRESHOLD &&
+              (now - lastInterimTime >= INTERIM_TIME_THRESHOLD) &&
+              (isSpeaking || transcript.length > 2) &&
+              transcript !== lastInterimTranscript) {
 
-            // Synthesize speech for interim results
-            synthesizeSpeech(transcript)
-              .then(audioBuffer => {
-                ws.send(JSON.stringify({
-                  type: 'tts',
-                  audio: audioBuffer.toString('base64'),
-                  isInterim: true
-                }));
-              })
-              .catch(err => {
-                console.error('TTS Error:', err);
-                ws.send(JSON.stringify({
-                  type: 'tts_error',
-                  error: 'Failed to synthesize speech'
-                }));
-              });
+              isSpeaking = true;
+              lastInterimTime = now;
+              lastInterimTranscript = transcript;
+
+              // Add to interim buffer
+              interimResultsBuffer.push(transcript);
+
+              // Send the latest interim result
+              ws.send(JSON.stringify({
+                transcript: transcript,
+                isInterim: true
+              }));
+            }
             return;
           }
 
           // Handle final results
           if (received.is_final) {
-            // Clear silence timer when we get speech
+            isSpeaking = false;
+            lastInterimTranscript = '';
+            interimResultsBuffer = [];
+
             if (silenceTimer) {
               clearTimeout(silenceTimer);
               silenceTimer = null;
             }
 
-            // Add to buffer if different from last transcript
             if (transcript !== lastTranscript) {
               transcriptBuffer.push(transcript);
               lastTranscript = transcript;
             }
 
-            // Send buffered transcripts and synthesize speech
             if (transcriptBuffer.length > 0) {
               const finalTranscript = transcriptBuffer.join(' ');
-              ws.send(JSON.stringify({ 
+              console.log('Final transcript before LLM:', finalTranscript);
+
+              ws.send(JSON.stringify({
                 transcript: finalTranscript,
-                isFinal: true 
+                isFinal: true
               }));
-              
-              // Synthesize speech for the final transcript
-              synthesizeSpeech(finalTranscript)
-                .then(audioBuffer => {
+
+              // Process final transcript through LLM and then TTS
+              try {
+                const processedText = await processInput(finalTranscript);
+                console.log('LLM processed text:', processedText);
+
+                const audioBuffer = await synthesizeSpeech(processedText);
+                if (audioBuffer) {
                   ws.send(JSON.stringify({
                     type: 'tts',
                     audio: audioBuffer.toString('base64'),
                     isFinal: true
                   }));
-                })
-                .catch(err => {
-                  console.error('TTS Error:', err);
-                  ws.send(JSON.stringify({
-                    type: 'tts_error',
-                    error: 'Failed to synthesize speech'
-                  }));
-                });
-                
+                }
+              } catch (err) {
+                console.error('Error in final processing:', err);
+                ws.send(JSON.stringify({
+                  type: 'tts_error',
+                  error: 'Failed to process or synthesize speech'
+                }));
+              }
+
               transcriptBuffer = [];
             }
-
-            // Start silence timer
-            silenceTimer = setTimeout(() => {
-              if (transcriptBuffer.length > 0) {
-                const finalTranscript = transcriptBuffer.join(' ');
-                ws.send(JSON.stringify({ 
-                  transcript: finalTranscript,
-                  isFinal: true 
-                }));
-                
-                // Synthesize speech for the final transcript
-                synthesizeSpeech(finalTranscript)
-                  .then(audioBuffer => {
-                    ws.send(JSON.stringify({
-                      type: 'tts',
-                      audio: audioBuffer.toString('base64'),
-                      isFinal: true
-                    }));
-                  })
-                  .catch(err => {
-                    console.error('TTS Error:', err);
-                    ws.send(JSON.stringify({
-                      type: 'tts_error',
-                      error: 'Failed to synthesize speech'
-                    }));
-                  });
-                  
-                transcriptBuffer = [];
-              }
-            }, SILENCE_THRESHOLD);
           }
         } else if (received.type === 'Metadata') {
           console.log('[Metadata]', received);
@@ -257,46 +237,41 @@ wss.on('connection', (ws) => {
     }
   };
 
-  const synthesizeSpeech = async (text) => {
-    const params = {
-      Text: text,
-      VoiceId: "Joanna",
-      OutputFormat: "mp3"
-    };
-    try {
-      const command = new SynthesizeSpeechCommand(params);
-      const data = await polly.send(command);
-
-      if (data.AudioStream) {
-        const audioBuffer = Buffer.from(await data.AudioStream.transformToByteArray());
-        return audioBuffer;
-      } else {
-        throw new Error("AudioStream not found in the response.");
-      }
-    } catch (err) {
-      console.error("Error synthesizing speech:", err);
-      throw err;
-    }
-  };
-
   // Initial connection to Deepgram
   connectToDeepgram();
 
   // Collect VAD output and send to Deepgram in chunks
   let deepgramBuffer = Buffer.alloc(0);
-  const CHUNK_SIZE = 3200; // Reduced chunk size for faster processing
+  const CHUNK_SIZE = 1600; // Reduced chunk size for faster processing
+  let isSpeechActive = false;
 
   vad.stdout.on('data', (data) => {
     try {
       const parsed = JSON.parse(data.toString());
-      const speechDetected = parsed.timestamps.length > 0;
 
-      if (speechDetected && parsed.chunk) {
+      // Handle VAD events
+      if (parsed.event === 'speech_start') {
+        isSpeechActive = true;
+        console.log('Speech started');
+      } else if (parsed.event === 'speech_end') {
+        isSpeechActive = false;
+        console.log('Speech ended');
+
+        // Force Deepgram to process final results
+        if (dgSocket?.readyState === WebSocket.OPEN) {
+          dgSocket.send(JSON.stringify({
+            "type": "Finalize"
+          }));
+        }
+      }
+
+      // Process audio chunks
+      if (parsed.chunk) {
         const audioBuffer = Buffer.from(parsed.chunk, 'hex');
         deepgramBuffer = Buffer.concat([deepgramBuffer, audioBuffer]);
 
         if (deepgramBuffer.length >= CHUNK_SIZE && dgSocket?.readyState === WebSocket.OPEN) {
-          audioStartTime = Date.now(); // Add this line to record start time
+          audioStartTime = Date.now();
           dgSocket.send(deepgramBuffer);
           deepgramBuffer = Buffer.alloc(0);
         }
@@ -347,4 +322,60 @@ wss.on('connection', (ws) => {
     cleanup();
     process.exit();
   });
+
+  async function processInput(input) {
+    try {
+      // console.log('Processing input through LLM:', input);
+      const response = await client.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: "You are a helpful assistant. Keep responses concise and natural."
+          },
+          {
+            role: "user",
+            content: input
+          }
+        ],
+        max_tokens: 150
+      });
+
+      const processedText = response.choices[0].message.content;
+      console.log('LLM processed text:', processedText);
+      return processedText;
+    } catch (error) {
+      console.error('Error processing input through LLM:', error);
+      return input; // Return original input if processing fails
+    }
+  }
+
+  const synthesizeSpeech = async (text) => {
+    if (!text) {
+      console.error('No text provided for synthesis');
+      return null;
+    }
+
+    console.log('Synthesizing speech for text:', text);
+    const params = {
+      Text: text,
+      VoiceId: "Joanna",
+      OutputFormat: "mp3"
+    };
+
+    try {
+      const command = new SynthesizeSpeechCommand(params);
+      const data = await polly.send(command);
+
+      if (data.AudioStream) {
+        const audioBuffer = Buffer.from(await data.AudioStream.transformToByteArray());
+        return audioBuffer;
+      } else {
+        throw new Error("AudioStream not found in the response.");
+      }
+    } catch (err) {
+      console.error("Error synthesizing speech:", err);
+      throw err;
+    }
+  };
 });
