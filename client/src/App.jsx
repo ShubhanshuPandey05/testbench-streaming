@@ -167,7 +167,8 @@ const App = () => {
             }
 
             // Queue the audio with its type (interim or final)
-            queueAudio(bytes.buffer, data.isInterim);
+            queueAudio(bytes.buffer, data.isFinal);
+            console.log('latency', data.latency);
             setLatency({
               llm: data.latency.llm,
               stt: data.latency.stt,

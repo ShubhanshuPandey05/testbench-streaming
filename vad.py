@@ -70,7 +70,7 @@ sample_rate = 16000
 min_chunk_samples = sample_rate // 4  # 0.5 seconds = 8000 samples
 frame_bytes = min_chunk_samples * 4  # 16-bit PCM = 2 bytes per sample
 threshold = 0.3
-prefix_duration = 0.2  # 200ms
+prefix_duration = 0.1  # 200ms
 prefix_samples = int(sample_rate * prefix_duration)
 prefix_buffer = deque(maxlen=prefix_samples)
 

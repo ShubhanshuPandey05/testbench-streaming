@@ -27,7 +27,7 @@ const latencyStats = {
   lastUpdate: Date.now()
 };
 
-const latency = {
+let latencyObj = {
   llm: 0,
   stt: 0,
   tts: 0,
@@ -210,9 +210,10 @@ wss.on('connection', (ws) => {
                     type: 'tts',
                     audio: audioBuffer.toString('base64'),
                     isFinal: true,
-                    latency: latency.tts
+                    latency: latencyObj
                   }));
                 }
+                // console.log('latency', latency);
               } catch (err) {
                 console.error('Error in final processing:', err);
                 ws.send(JSON.stringify({
@@ -272,6 +273,15 @@ wss.on('connection', (ws) => {
   let deepgramBuffer = Buffer.alloc(0);
   const CHUNK_SIZE = 6400; // Reduced chunk size for faster processing
   let isSpeechActive = false;
+
+  setInterval(() => {
+    if (!isSpeechActive) {
+      dgSocket.send(JSON.stringify({
+        "type": "KeepAlive"
+      }));
+      console.log('KeepAlive sent');
+    }
+  }, 10000);
 
   vad.stdout.on('data', (data) => {
     try {
@@ -352,36 +362,82 @@ wss.on('connection', (ws) => {
   });
 
   async function processInput(input) {
+    const apiKey = process.env.OPEN_AI; // Replace with your actual API key
+    const url = 'https://api.openai.com/v1/chat/completions';
+
+    const payload = {
+      model: "gpt-4o-mini", // or gpt-4-1106-preview, depending on what's available
+      messages: [
+        {
+          role: "system",
+          content: "You are a helpful assistant. Keep responses concise and natural. Keep responses short and concise."
+        },
+        {
+          role: "user",
+          content: input
+        }
+      ],
+      max_tokens: 30,
+      temperature: 0.1
+    };
+
     try {
-      // console.log('Processing input through LLM:', input);
       let latency = Date.now();
-      const response = await client.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: "You are a helpful assistant. Keep responses concise and natural. Keep responses short and concise."
-          },
-          {
-            role: "user",
-            content: input
-          }
-        ],
-        max_tokens: 30,
-        temperature: 0.1,
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(payload)
       });
 
-      const processedText = response.choices[0].message.content;
+      const data = await response.json();
       latency = Date.now() - latency;
       console.log('LLM latency:', latency);
-      latency.llm = latency;
-      // console.log('LLM processed text:', processedText);
+      latencyObj.llm = latency;
+
+      const processedText = data.choices[0].message.content;
       return processedText;
+
     } catch (error) {
       console.error('Error processing input through LLM:', error);
-      return input; // Return original input if processing fails
+      return input; // fallback
     }
   }
+
+  // async function processInput(input) {
+  //   try {
+  //     // console.log('Processing input through LLM:', input);
+  //     let latency = Date.now();
+  //     const response = await client.chat.completions.create({
+  //       model: "gpt-4o-mini",
+  //       messages: [
+  //         {
+  //           role: "system",
+  //           content: "You are a helpful assistant. Keep responses concise and natural. Keep responses short and concise."
+  //         },
+  //         {
+  //           role: "user",
+  //           content: input
+  //         }
+  //       ],
+  //       max_tokens: 30,
+  //       temperature: 0.1,
+  //     });
+
+  //     const processedText = response.choices[0].message.content;
+  //     latency = Date.now() - latency;
+  //     console.log('LLM latency:', latency);
+  //     latencyObj.llm = latency;
+  //     // console.log('LLM processed text:', processedText);
+  //     return processedText;
+  //   } catch (error) {
+  //     console.error('Error processing input through LLM:', error);
+  //     return input; // Return original input if processing fails
+  //   }
+  // }
 
   const synthesizeSpeech = async (text) => {
     if (!text) {
@@ -402,7 +458,7 @@ wss.on('connection', (ws) => {
       const data = await polly.send(command);
       latency = Date.now() - latency;
       console.log('TTS latency:', latency);
-      latency.tts = latency;
+      latencyObj.tts = latency;
 
       if (data.AudioStream) {
         const audioBuffer = Buffer.from(await data.AudioStream.transformToByteArray());
