@@ -33,6 +33,8 @@ let latencyObj = {
   tts: 0,
 };
 
+// let outputType = 'audio';
+
 const updateLatencyStats = (latency) => {
   latencyStats.totalLatency += latency;
   latencyStats.count++;
@@ -200,15 +202,24 @@ wss.on('connection', (ws) => {
 
               // Process final transcript through LLM and then TTS
               try {
-                const processedText = await processInput(finalTranscript);
+                const { processedText, outputType } = await processInput(finalTranscript);
                 console.log('LLM processed text:', processedText);
 
                 // await synthesizeSpeech(processedText, ws);
-                const audioBuffer = await synthesizeSpeech(processedText);
-                if (audioBuffer) {
+                if (outputType === 'audio') {
+                  const audioBuffer = await synthesizeSpeech(processedText);
+                  if (audioBuffer) {
+                    ws.send(JSON.stringify({
+                      type: 'audio',
+                      audio: audioBuffer.toString('base64'),
+                      isFinal: true,
+                      latency: latencyObj
+                    }));
+                  }
+                } else {
                   ws.send(JSON.stringify({
-                    type: 'tts',
-                    audio: audioBuffer.toString('base64'),
+                    type: 'text',
+                    text: processedText,
                     isFinal: true,
                     latency: latencyObj
                   }));
@@ -321,8 +332,38 @@ wss.on('connection', (ws) => {
 
   // Receive raw audio from client
   ws.on('message', (data) => {
-    if (ffmpeg.stdin.writable) {
-      ffmpeg.stdin.write(data);
+    try {
+      const parsedData = JSON.parse(data);
+      if (parsedData.type === 'chat') {
+        console.log('Received chat message:', parsedData.message);
+        async function generateResponse(input) {
+          const { processedText, outputType } = await processInput(input);
+          console.log('LLM processed text:', processedText);
+          if (outputType === 'text') {
+            ws.send(JSON.stringify({
+              type: 'text',
+              text: processedText,
+              isFinal: true,
+              latency: latencyObj
+            }));
+          } else if (outputType === 'audio') {
+            const audioBuffer = await synthesizeSpeech(processedText);
+            if (audioBuffer) {
+              ws.send(JSON.stringify({
+                type: 'audio',
+                audio: audioBuffer.toString('base64'),
+                isFinal: true,
+                latency: latencyObj
+              }));
+            }
+          }
+        }
+        generateResponse(parsedData.message);
+      }
+    } catch (err) {
+      if (ffmpeg.stdin.writable) {
+        ffmpeg.stdin.write(data);
+      }
     }
   });
 
@@ -361,23 +402,115 @@ wss.on('connection', (ws) => {
     process.exit();
   });
 
+  // async function processInput(input) {
+  //   const apiKey = process.env.OPEN_AI; // Replace with your actual API key
+  //   const url = 'https://api.openai.com/v1/chat/completions';
+
+  //   const payload = {
+  //     model: "gpt-4o-mini", // or gpt-4-1106-preview, depending on what's available
+  //     messages: [
+  //       {
+  //         role: "system",
+  //         content: "You are a helpful assistant. Keep responses concise and natural. Keep responses short and concise."
+  //       },
+  //       {
+  //         role: "user",
+  //         content: input
+  //       }
+  //     ],
+  //     max_tokens: 30,
+  //     temperature: 0.1
+  //   };
+
+  //   try {
+  //     let latency = Date.now();
+
+  //     const response = await fetch(url, {
+  //       method: 'POST',
+  //       headers: {
+  //         'Content-Type': 'application/json',
+  //         'Authorization': `Bearer ${apiKey}`
+  //       },
+  //       body: JSON.stringify(payload)
+  //     });
+
+  //     const data = await response.json();
+  //     latency = Date.now() - latency;
+  //     console.log('LLM latency:', latency);
+  //     latencyObj.llm = latency;
+
+  //     const processedText = data.choices[0].message.content;
+  //     return processedText;
+
+  //   } catch (error) {
+  //     console.error('Error processing input through LLM:', error);
+  //     return input; // fallback
+  //   }
+  // }
+
+
+  let message = [
+    {
+      role: "system",
+      content: `You are a helpful assistant. Always reply in JSON with two keys: 'output' (the answer) and 'outputType' (either 'text' or 'audio') This will be based on the user query, For each user query, decide if the response should be delivered as "text" or "audio". 
+- Choose "text" for sensitive info (emails, codes, etc.).
+- Choose "audio" for general or conversational replies.. And also give the response in short and concise manner."`
+    }
+  ]
+
+
   async function processInput(input) {
-    const apiKey = process.env.OPEN_AI; // Replace with your actual API key
+    const apiKey = process.env.OPEN_AI;
     const url = 'https://api.openai.com/v1/chat/completions';
 
+    // Tool definition
+    // const tools = [
+    //   {
+    //     type: "function",
+    //     function: {
+    //       name: "setOutputType",
+    //       description: "Decide whether the response should be delivered as text or audio.",
+    //       parameters: {
+    //         type: "object",
+    //         properties: {
+    //           outputType: {
+    //             type: "string",
+    //             enum: ["text", "audio"],
+    //             description: "The preferred output type for this response."
+    //           },
+    //           reason: {
+    //             type: "string",
+    //             description: "A brief explanation for choosing this output type."
+    //           }
+    //         },
+    //         required: ["outputType"]
+    //       }
+    //     }
+    //   }
+    // ];
+
+    // System prompt
+    //   const systemPrompt = `
+    // You are a helpful assistant. 
+    // Keep responses concise and natural.
+    // And also give the response in short and concise manner.
+    // For each user query, decide if the response should be delivered as "text" or "audio". 
+    // Use the setOutputType tool:
+    // - Choose "text" for sensitive info (emails, codes, etc.).
+    // - Choose "audio" for general or conversational replies.
+    // `;
+
+
+    message.push({
+      role: "user",
+      content: input
+    })
+
     const payload = {
-      model: "gpt-4o-mini", // or gpt-4-1106-preview, depending on what's available
-      messages: [
-        {
-          role: "system",
-          content: "You are a helpful assistant. Keep responses concise and natural. Keep responses short and concise."
-        },
-        {
-          role: "user",
-          content: input
-        }
-      ],
-      max_tokens: 30,
+      model: "gpt-4o-mini",
+      messages: message,
+      // tools: tools,
+      max_tokens: 100, // Increase if you expect tool call + reasoning
       temperature: 0.1
     };
 
@@ -398,14 +531,34 @@ wss.on('connection', (ws) => {
       console.log('LLM latency:', latency);
       latencyObj.llm = latency;
 
-      const processedText = data.choices[0].message.content;
-      return processedText;
+      // Check for tool calls in the response
+      let outputType = 'audio'; // default
+      // if (data.choices[0].message.tool_calls) {
+      //   const toolCall = data.choices[0].message.tool_calls.find(tc => tc.function.name === "setOutputType");
+      //   if (toolCall) {
+      //     const args = JSON.parse(toolCall.function.arguments);
+      //     outputType = args.outputType;
+      //     console.log("LLM decided outputType:", outputType, "| Reason:", args.reason);
+      //   }
+      // }
+      // console.log(data.choices[0].message.content)
+      const parsedData = JSON.parse(data.choices[0].message.content);
+      outputType = parsedData.outputType;
+      console.log("LLM decided outputType:", outputType, "| Reason:", parsedData.reason);
+      const processedText = parsedData.output;
+      message.push({
+        role: "assistant",
+        content: processedText
+      })
+      // You can now use outputType in your code as needed
+      return { processedText, outputType };
 
     } catch (error) {
       console.error('Error processing input through LLM:', error);
-      return input; // fallback
+      return { processedText: input, outputType: 'text' }; // fallback
     }
   }
+
 
   // async function processInput(input) {
   //   try {

@@ -18,7 +18,10 @@ const App = () => {
   const isPlayingRef = useRef(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const lastInterimTimeRef = useRef(0);
-  const INTERIM_THRESHOLD = 500; // Minimum time between interim audio playback
+  const INTERIM_THRESHOLD = 500;
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  // const [isChatActive, setIsChatActive] = useState(false);
   const [latency, setLatency] = useState({
     llm: 0,
     stt: 0,
@@ -123,6 +126,22 @@ const App = () => {
     }
   };
 
+  const handleChatSubmit = (e) => {
+    e.preventDefault();
+    setChatMessages([...chatMessages, { role: 'user', content: chatInput }]);
+    console.log('Sending chat message:', chatInput);
+    // console.log(wsRef.current);
+    wsRef.current.send(JSON.stringify({
+      type: 'chat',
+      message: chatInput
+    }));
+    setChatInput('');
+  };
+
+  const handleChatInput = (e) => {
+    setChatInput(e.target.value);
+  };
+
   const startRecording = async () => {
     try {
       setError(null);
@@ -158,7 +177,7 @@ const App = () => {
         try {
           const data = JSON.parse(event.data);
 
-          if (data.type === 'tts') {
+          if (data.type === 'audio') {
             // Convert base64 to ArrayBuffer
             const binaryString = window.atob(data.audio);
             const bytes = new Uint8Array(binaryString.length);
@@ -183,6 +202,9 @@ const App = () => {
               setTranscript(prev => prev + ' ' + data.transcript);
               setInterimTranscript('');
             }
+          } else if (data.type === 'text') {
+            console.log('text', data.text);
+            setChatMessages(prev => [...prev, { role: 'assistant', content: data.text }]);
           } else if (data.error) {
             setError(data.error);
           }
@@ -312,6 +334,17 @@ const App = () => {
           <p>LLM: {latency.llm}ms</p>
           <p>STT: {latency.stt}ms</p>
           <p>TTS: {latency.tts}ms</p>
+        </div>
+      </div>
+
+      <div>
+        <h2>Chat</h2>
+        <div className="chat-container">
+          <div className="chat-messages"></div>
+        </div>
+        <div className="chat-input">
+          <input type="text" placeholder="Message" value={chatInput} onChange={handleChatInput} />
+          <button onClick={handleChatSubmit}>Send</button>
         </div>
       </div>
     </div>

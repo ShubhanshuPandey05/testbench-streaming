@@ -1,8 +1,10 @@
 {
   "name": "test_bench",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "src/server.js",
   "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -20,6 +22,10 @@
     "node-vad": "^1.1.4",
     "openai": "^4.103.0",
     "speaker": "^0.5.5",
+    "uuid": "^9.0.1",
     "ws": "^8.18.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
   }
 }
