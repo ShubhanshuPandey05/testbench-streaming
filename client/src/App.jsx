@@ -154,6 +154,7 @@ const App = () => {
       });
       setupAudioAnalysis(stream);
 
+      // wsRef.current = new WebSocket('wss://a31a-2401-4900-1c80-9450-6c61-8e74-1d49-209a.ngrok-free.app');
       wsRef.current = new WebSocket('ws://localhost:5001');
       let reconnectTimeout = null;
 
@@ -283,72 +284,110 @@ const App = () => {
 
 
   return (
-    <div className="app-container">
-      <div className="status-bar">
-        <div className={`connection-status ${isConnected ? 'connected' : 'disconnected'}`}>
-          {isConnected ? 'Connected' : 'Disconnected'}
+    <div className="min-h-screen bg-gradient-to-br from-gray-900 to-gray-800 text-white p-6">
+
+      {/* Header */}
+      <header className="mb-6 text-center">
+        <h1 className="text-3xl font-extrabold tracking-wide">🎙️ Voice Agent Dashboard</h1>
+        <p className="text-sm text-gray-400 mt-1">Monitor, Record & Interact</p>
+      </header>
+
+      {/* Status Card */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+        <div className="bg-white/10 backdrop-blur-md p-4 rounded-xl border border-white/20 shadow-md">
+          <p className="text-sm text-gray-300">Connection</p>
+          <div className={`mt-1 text-lg font-bold ${isConnected ? 'text-green-400' : 'text-red-400'
+            }`}>
+            {isConnected ? 'Connected' : 'Disconnected'}
+          </div>
+          {error && <div className="mt-2 text-red-300 text-sm">{error}</div>}
+          {isPlaying && <div className="mt-2 text-blue-300 text-sm">Playing back...</div>}
         </div>
-        {error && <div className="error-message">{error}</div>}
-        {isPlaying && <div className="playing-status">Playing back...</div>}
+
+        <div className="bg-white/10 backdrop-blur-md p-4 rounded-xl border border-white/20 shadow-md">
+          <p className="text-sm text-gray-300 mb-1">Audio Level</p>
+          <div className="w-full bg-gray-600 h-3 rounded-full overflow-hidden">
+            <div
+              className={`h-full transition-all duration-500 ${recording ? 'bg-green-500' : 'bg-gray-300'
+                }`}
+              style={{ width: `${audioLevel}%` }}
+            ></div>
+          </div>
+        </div>
+
+        <div className="bg-white/10 backdrop-blur-md p-4 rounded-xl border border-white/20 shadow-md">
+          <p className="text-sm text-gray-300">Latency (ms)</p>
+          <div className="mt-2 space-y-1">
+            <p><span className="text-gray-400">LLM:</span> {latency.llm}</p>
+            <p><span className="text-gray-400">STT:</span> {latency.stt}</p>
+            <p><span className="text-gray-400">TTS:</span> {latency.tts}</p>
+          </div>
+        </div>
       </div>
 
-      <div className="audio-visualizer">
-        <div
-          className="audio-level"
-          style={{
-            width: `${audioLevel}%`,
-            backgroundColor: recording ? '#4CAF50' : '#9e9e9e'
-          }}
-        />
-      </div>
-
-      <div className="controls">
+      {/* Controls */}
+      <div className="flex flex-wrap gap-4 mb-6 justify-center">
         {recording ? (
-          <button className="stop-button" onClick={stopRecording}>
-            Stop Recording
+          <button
+            onClick={stopRecording}
+            className="bg-red-600 hover:bg-red-700 transition px-6 py-2 rounded-full font-semibold shadow"
+          >
+            ⏹ Stop Recording
           </button>
         ) : (
-          <button className="start-button" onClick={startRecording}>
-            Start Recording
+          <button
+            onClick={startRecording}
+            className="bg-green-600 hover:bg-green-700 transition px-6 py-2 rounded-full font-semibold shadow"
+          >
+            🎙️ Start Recording
           </button>
         )}
-        <button className="clear-button" onClick={clearTranscript}>
-          Clear Transcript
+        <button
+          onClick={clearTranscript}
+          className="bg-yellow-600 hover:bg-yellow-700 transition px-6 py-2 rounded-full font-semibold shadow"
+        >
+          🧹 Clear Transcript
         </button>
       </div>
 
-      <div className="transcript-container">
-        <h2>Transcript</h2>
-        <div className="transcript">
+      {/* Transcript */}
+      <div className="bg-white/10 backdrop-blur-md p-6 rounded-xl border border-white/20 shadow-md mb-6">
+        <h2 className="text-2xl font-bold mb-2">📝 Transcript</h2>
+        <div className="text-gray-200 whitespace-pre-wrap break-words h-40 overflow-y-auto">
           {transcript}
           {interimTranscript && (
-            <span className="interim-text">{interimTranscript}</span>
+            <span className="italic text-gray-400">{interimTranscript}</span>
           )}
           <div ref={transcriptEndRef} />
         </div>
       </div>
 
-      <div className="latency-container">
-        <h2>Latency</h2>
-        <div className="latency">
-          <p>LLM: {latency.llm}ms</p>
-          <p>STT: {latency.stt}ms</p>
-          <p>TTS: {latency.tts}ms</p>
-        </div>
-      </div>
-
-      <div>
-        <h2>Chat</h2>
-        <div className="chat-container">
+      {/* Chat Section */}
+      <div className="bg-white/10 backdrop-blur-md p-6 rounded-xl border border-white/20 shadow-md">
+        <h2 className="text-2xl font-bold mb-4">💬 Chat</h2>
+        <div className="h-40 bg-white/5 rounded-lg overflow-y-auto p-3 mb-4 text-sm text-gray-200 border border-white/10">
           <div className="chat-messages"></div>
         </div>
-        <div className="chat-input">
-          <input type="text" placeholder="Message" value={chatInput} onChange={handleChatInput} />
-          <button onClick={handleChatSubmit}>Send</button>
+        <div className="flex gap-2">
+          <input
+            type="text"
+            placeholder="Type your message..."
+            value={chatInput}
+            onChange={handleChatInput}
+            className="flex-1 bg-white/10 text-white placeholder-gray-400 px-4 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"
+          />
+          <button
+            onClick={handleChatSubmit}
+            className="bg-blue-600 hover:bg-blue-700 transition px-5 py-2 rounded-lg font-semibold shadow"
+          >
+            Send
+          </button>
         </div>
       </div>
     </div>
   );
+
+
 };
 
 export default App;

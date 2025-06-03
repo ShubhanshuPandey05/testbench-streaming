@@ -4,7 +4,8 @@ require('dotenv').config();
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 const { PollyClient, SynthesizeSpeechCommand } = require("@aws-sdk/client-polly");
 const OpenAI = require("openai");
-
+const twilio = require('twilio');
+const twilioClient = new twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const wss = new WebSocket.Server({ port: 5001 });
 console.log("✅ WebSocket server started on ws://localhost:5001");
 
@@ -39,6 +40,63 @@ let latencyObj = {
   stt: 0,
   tts: 0,
 };
+
+
+let streamSid = "";
+let callSid = "";
+
+
+async function convertMp3ToMulaw(mp3Buffer) {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn('ffmpeg', [
+      '-i', 'pipe:0',         // Input from stdin
+      '-f', 'mulaw',          // Output format: mulaw
+      '-ar', '8000',          // Output sample rate: 8kHz
+      '-ac', '1',             // Mono
+      'pipe:1'                // Output to stdout
+    ]);
+
+    let mulawBuffer = Buffer.alloc(0);
+
+    ffmpeg.stdout.on('data', (data) => {
+      mulawBuffer = Buffer.concat([mulawBuffer, data]);
+    });
+
+    ffmpeg.stderr.on('data', (data) => {
+      // Optional: log ffmpeg errors
+    });
+
+    ffmpeg.on('close', (code) => {
+      if (code === 0) {
+        resolve(mulawBuffer);
+      } else {
+        reject(new Error('ffmpeg process failed'));
+      }
+    });
+
+    ffmpeg.stdin.write(mp3Buffer);
+    ffmpeg.stdin.end();
+  });
+}
+
+
+
+function streamMulawAudioToTwilio(ws, streamSid, mulawBuffer) {
+  const CHUNK_SIZE = 160; // 20ms for 8kHz mulaw
+  let offset = 0;
+  function sendChunk() {
+    if (offset >= mulawBuffer.length) return;
+    const chunk = mulawBuffer.slice(offset, offset + CHUNK_SIZE);
+    ws.send(JSON.stringify({
+      event: 'media',
+      streamSid,
+      media: { payload: chunk.toString('base64') }
+    }));
+    offset += CHUNK_SIZE;
+    setTimeout(sendChunk, 20);
+  }
+  sendChunk();
+}
 
 // let outputType = 'audio';
 
@@ -77,15 +135,16 @@ const vad = spawn(pythonPath, ['vad.py']);
 // Spawn FFmpeg to decode audio to PCM with optimized settings
 const ffmpeg = spawn('ffmpeg', [
   '-loglevel', 'quiet',
-  '-i', 'pipe:0',        // input from stdin
-  '-f', 's16le',         // raw PCM output
-  '-acodec', 'pcm_s16le',
+  '-f', 'mulaw',         // input format is mulaw
+  '-ar', '8000',         // input sample rate is 8kHz (Twilio default)
   '-ac', '1',            // mono
-  '-ar', '16000',        // 16kHz
-  '-threads', '0',       // use all available threads
-  '-af', 'highpass=f=200,lowpass=f=3000', // basic noise filtering
-  'pipe:1'               // output to stdout
+  '-i', 'pipe:0',        // input from stdin
+  '-f', 's16le',         // output format: raw PCM
+  '-acodec', 'pcm_s16le',
+  '-ar', '16000',        // output sample rate (16kHz for many STT models)
+  'pipe:1'
 ]);
+
 
 const deepgram = createClient(process.env.DEEPGRAM_API);
 
@@ -312,101 +371,6 @@ wss.on('connection', (ws) => {
                 transcript: finalTranscript,
                 isFinal: true
               }));
-
-              // Here we will impliment the logic of turn detection
-              // try {
-              //   // console.log("calling turn detector")
-              //   fullMessage = `${fullMessage} ${finalTranscript}`;
-              //   // console.log(fullMessage)
-              //   const result = isTurnComplete(fullMessage);
-              //   console.log("Full message:", fullMessage)
-              //   if (result === true) {
-              //     // Process final transcript through LLM and then TTS
-              //     try {
-              //       console.log('Final transcript before LLM:', fullMessage);
-              //       const { processedText, outputType } = await processInput(`{message:${fullMessage}, type:'audio'}`);
-              //       // console.log('LLM processed text:', processedText);
-
-              //       // await synthesizeSpeech(processedText, ws);
-              //       if (outputType === 'audio') {
-              //         console.log("tts called")
-              //         const audioBuffer = await synthesizeSpeechWithPolly(processedText);
-              //         if (audioBuffer) {
-              //           // console.log("audio buffer")
-              //           ws.send(JSON.stringify({
-              //             type: 'audio',
-              //             audio: audioBuffer.toString('base64'),
-              //             isFinal: true,
-              //             latency: latencyObj
-              //           }));
-              //         }
-              //       } else {
-              //         ws.send(JSON.stringify({
-              //           type: 'text',
-              //           text: processedText,
-              //           isFinal: true,
-              //           latency: latencyObj
-              //         }));
-              //       }
-              //       // console.log('latency', latency);
-              //     } catch (err) {
-              //       console.error('Error in final processing:', err);
-              //       ws.send(JSON.stringify({
-              //         type: 'tts_error',
-              //         error: 'Failed to process or synthesize speech'
-              //       }));
-              //     }
-              //     fullMessage = ""
-              //   } else {
-              //     console.log("user may speak further but if not in 3 seconds we will continue with this message");
-              //     userSpeak = false
-              //     setTimeout(async() => {
-              //       if (userSpeak === false) {
-              //         try {
-              //           console.log('Final transcript before LLM:', finalTranscript);
-              //           const { processedText, outputType } = await processInput(`{message:${fullMessage}, type:'audio'}`);
-              //           // console.log('LLM processed text:', processedText);
-
-              //           // await synthesizeSpeech(processedText, ws);
-              //           if (outputType === 'audio') {
-              //             console.log("tts called")
-              //             const audioBuffer = await synthesizeSpeechWithPolly(processedText);
-              //             if (audioBuffer) {
-              //               // console.log("audio buffer")
-              //               ws.send(JSON.stringify({
-              //                 type: 'audio',
-              //                 audio: audioBuffer.toString('base64'),
-              //                 isFinal: true,
-              //                 latency: latencyObj
-              //               }));
-              //             }
-              //           } else {
-              //             ws.send(JSON.stringify({
-              //               type: 'text',
-              //               text: processedText,
-              //               isFinal: true,
-              //               latency: latencyObj
-              //             }));
-              //           }
-              //           // console.log('latency', latency);
-              //         } catch (err) {
-              //           console.error('Error in final processing:', err);
-              //           ws.send(JSON.stringify({
-              //             type: 'tts_error',
-              //             error: 'Failed to process or synthesize speech'
-              //           }));
-              //         }
-              //         fullMessage = ""
-              //       }
-              //     }, 3000)
-
-              //   }
-
-              // } catch (error) {
-              // }
-
-
-
               try {
                 console.log('Final transcript before LLM:', finalTranscript);
                 const { processedText, outputType } = await processInput(`{message:${finalTranscript}, type:'audio'}`);
@@ -416,15 +380,34 @@ wss.on('connection', (ws) => {
                 if (outputType === 'audio') {
                   console.log("tts called")
                   const audioBuffer = await synthesizeSpeechWithPolly(processedText);
-                  if (audioBuffer) {
-                    // console.log("audio buffer")
+                  const mulawBuffer = await convertMp3ToMulaw(audioBuffer);
+                  if (mulawBuffer) {
+                    // const CHUNK_SIZE = 400; // 20ms for 8kHz mulaw
+                    // let offset = 0;
+
+                    // function sendChunk() {
+                    //   if (offset >= mulawBuffer.length) return; // All done
+                    //   // console.log(streamSid)
+
+                    //   const chunk = mulawBuffer.slice(offset, offset + CHUNK_SIZE);
+                    //   ws.send(JSON.stringify({
+                    //     event: 'media',
+                    //     streamSid,
+                    //     media: { payload: chunk.toString('base64') }
+                    //   }));
+
+                    //   offset += CHUNK_SIZE;
+                    //   setTimeout(sendChunk, 60); // Schedule next chunk after 20ms
+                    // }
+
+                    // sendChunk(); // Start streaming
                     ws.send(JSON.stringify({
-                      type: 'audio',
-                      audio: audioBuffer.toString('base64'),
-                      isFinal: true,
-                      latency: latencyObj
-                    }));
+                        event: 'media',
+                        streamSid,
+                        media: { payload: mulawBuffer.toString('base64') }
+                      }));
                   }
+
                 } else {
                   ws.send(JSON.stringify({
                     type: 'text',
@@ -441,17 +424,6 @@ wss.on('connection', (ws) => {
                   error: 'Failed to process or synthesize speech'
                 }));
               }
-
-              // try {
-              //   message.push({
-              //     role: "user",
-              //     content: finalTranscript
-              //   })
-              //   isTurnComplete(message)
-              // } catch (error) {
-
-              // }
-
               transcriptBuffer = [];
             }
           }
@@ -549,42 +521,69 @@ wss.on('connection', (ws) => {
   });
 
   // Receive raw audio from client
-  ws.on('message', (data) => {
+  ws.on('message', async (data) => {
+    let parsedData;
     try {
-      const parsedData = JSON.parse(data);
-      if (parsedData.type === 'chat') {
-        console.log('Received chat message:', parsedData.message);
-        async function generateResponse(input) {
-          const { processedText, outputType } = await processInput(input);
-          console.log('LLM processed text:', processedText);
-          if (outputType === 'text') {
-            ws.send(JSON.stringify({
-              type: 'text',
-              text: processedText,
-              isFinal: true,
-              latency: latencyObj
-            }));
-          } else if (outputType === 'audio') {
-            const audioBuffer = await synthesizeSpeechWithPolly(processedText);
-            if (audioBuffer) {
-              ws.send(JSON.stringify({
-                type: 'audio',
-                audio: audioBuffer.toString('base64'),
-                isFinal: true,
-                latency: latencyObj
-              }));
-            }
-          }
-        }
-        console.log(`{message:'${parsedData.message}', type:'${parsedData.type}'}`);
-        generateResponse(`{message:'${parsedData.message}', type:'${parsedData.type}}'`);
-      }
+      parsedData = JSON.parse(data);
     } catch (err) {
-      if (ffmpeg.stdin.writable) {
-        ffmpeg.stdin.write(data);
+      console.error('Failed to parse JSON:', err);
+      return;
+    }
+
+    // Handle chat messages
+    if (parsedData.type === 'chat') {
+      console.log('Received chat message:', parsedData.message);
+      const { processedText, outputType } = await processInput(parsedData.message);
+      console.log('LLM processed text:', processedText);
+
+      if (outputType === 'text') {
+        ws.send(JSON.stringify({
+          type: 'text',
+          text: processedText,
+          isFinal: true,
+          latency: latencyObj
+        }));
+      } else if (outputType === 'audio') {
+        const audioBuffer = await synthesizeSpeechWithPolly(processedText);
+        if (audioBuffer) {
+          ws.send(JSON.stringify({
+            type: 'audio',
+            audio: audioBuffer.toString('base64'),
+            isFinal: true,
+            latency: latencyObj
+          }));
+        }
       }
     }
+
+    // Handle media messages (from Twilio)
+    if (parsedData.event === 'media' && parsedData.media && parsedData.media.payload) {
+      // Decode base64 audio payload
+      const audioBuffer = Buffer.from(parsedData.media.payload, 'base64');
+      if (ffmpeg.stdin.writable) {
+        ffmpeg.stdin.write(audioBuffer);
+      }
+    }
+
+    if (parsedData.event == 'start') {
+      streamSid = parsedData.streamSid
+      console.log("strem started", streamSid)
+      // console.log(parsedData)
+      // callSid = parsedData.start.callSid;
+      // 1. Announcement text
+      // const announcementText = "Hello! You are speaking to an AI assistant.";
+
+      // // 2. Synthesize speech with Polly
+      // const mp3Buffer = await synthesizeSpeechWithPolly(announcementText);
+
+      // // 3. Convert MP3 to mulaw 8kHz
+      // const mulawBuffer = await convertMp3ToMulaw(mp3Buffer);
+
+      // // 4. Stream the announcement audio to Twilio
+      // streamMulawAudioToTwilio(ws, streamSid, mulawBuffer);
+    }
   });
+
 
   // Handle client disconnection
   ws.on('close', () => {
@@ -621,101 +620,15 @@ wss.on('connection', (ws) => {
     process.exit();
   });
 
-  // async function processInput(input) {
-  //   const apiKey = process.env.OPEN_AI; // Replace with your actual API key
-  //   const url = 'https://api.openai.com/v1/chat/completions';
-
-  //   const payload = {
-  //     model: "gpt-4o-mini", // or gpt-4-1106-preview, depending on what's available
-  //     messages: [
-  //       {
-  //         role: "system",
-  //         content: "You are a helpful assistant. Keep responses concise and natural. Keep responses short and concise."
-  //       },
-  //       {
-  //         role: "user",
-  //         content: input
-  //       }
-  //     ],
-  //     max_tokens: 30,
-  //     temperature: 0.1
-  //   };
-
-  //   try {
-  //     let latency = Date.now();
-
-  //     const response = await fetch(url, {
-  //       method: 'POST',
-  //       headers: {
-  //         'Content-Type': 'application/json',
-  //         'Authorization': `Bearer ${apiKey}`
-  //       },
-  //       body: JSON.stringify(payload)
-  //     });
-
-  //     const data = await response.json();
-  //     latency = Date.now() - latency;
-  //     console.log('LLM latency:', latency);
-  //     latencyObj.llm = latency;
-
-  //     const processedText = data.choices[0].message.content;
-  //     return processedText;
-
-  //   } catch (error) {
-  //     console.error('Error processing input through LLM:', error);
-  //     return input; // fallback
-  //   }
-  // }
-
   async function processInput(input) {
     const apiKey = process.env.OPEN_AI;
     const url = 'https://api.openai.com/v1/chat/completions';
-
-    // Tool definition
-    // const tools = [
-    //   {
-    //     type: "function",
-    //     function: {
-    //       name: "setOutputType",
-    //       description: "Decide whether the response should be delivered as text or audio.",
-    //       parameters: {
-    //         type: "object",
-    //         properties: {
-    //           outputType: {
-    //             type: "string",
-    //             enum: ["text", "audio"],
-    //             description: "The preferred output type for this response."
-    //           },
-    //           reason: {
-    //             type: "string",
-    //             description: "A brief explanation for choosing this output type."
-    //           }
-    //         },
-    //         required: ["outputType"]
-    //       }
-    //     }
-    //   }
-    // ];
-
-    // System prompt
-    //   const systemPrompt = `
-    // You are a helpful assistant. 
-    // Keep responses concise and natural.
-    // And also give the response in short and concise manner.
-    // For each user query, decide if the response should be delivered as "text" or "audio". 
-    // Use the setOutputType tool:
-    // - Choose "text" for sensitive info (emails, codes, etc.).
-    // - Choose "audio" for general or conversational replies.
-    // `;
-
 
     message.push({
       role: "user",
       content: input
     })
 
-
-    // console.log(message)
 
     const payload = {
       model: "gpt-4o-mini",
@@ -742,16 +655,8 @@ wss.on('connection', (ws) => {
       console.log('LLM latency:', latency);
       latencyObj.llm = latency;
 
-      // Check for tool calls in the response
+
       let outputType = 'audio'; // default
-      // if (data.choices[0].message.tool_calls) {
-      //   const toolCall = data.choices[0].message.tool_calls.find(tc => tc.function.name === "setOutputType");
-      //   if (toolCall) {
-      //     const args = JSON.parse(toolCall.function.arguments);
-      //     outputType = args.outputType;
-      //     console.log("LLM decided outputType:", outputType, "| Reason:", args.reason);
-      //   }
-      // }
       console.log(data.choices[0].message.content)
       try {
         const parsedData = JSON.parse(data.choices[0].message.content);
@@ -762,6 +667,13 @@ wss.on('connection', (ws) => {
           role: "assistant",
           content: processedText
         })
+        // twilioClient.calls(callSid).update({
+        //   twiml: `<Response>
+        //     <Say>${processedText}</Say>
+        //     <Redirect>https://temp-vb4k.onrender.com/voice</Redirect>
+        //  </Response>`
+        // });
+
         // You can now use outputType in your code as needed
         return { processedText, outputType };
       } catch (error) {
@@ -778,39 +690,6 @@ wss.on('connection', (ws) => {
       return { processedText: input, outputType: 'text' }; // fallback
     }
   }
-
-  // async function processInput(input) {
-  //   try {
-  //     // console.log('Processing input through LLM:', input);
-  //     let latency = Date.now();
-  //     const response = await client.chat.completions.create({
-  //       model: "gpt-4o-mini",
-  //       messages: [
-  //         {
-  //           role: "system",
-  //           content: "You are a helpful assistant. Keep responses concise and natural. Keep responses short and concise."
-  //         },
-  //         {
-  //           role: "user",
-  //           content: input
-  //         }
-  //       ],
-  //       max_tokens: 30,
-  //       temperature: 0.1,
-  //     });
-
-  //     const processedText = response.choices[0].message.content;
-  //     latency = Date.now() - latency;
-  //     console.log('LLM latency:', latency);
-  //     latencyObj.llm = latency;
-  //     // console.log('LLM processed text:', processedText);
-  //     return processedText;
-  //   } catch (error) {
-  //     console.error('Error processing input through LLM:', error);
-  //     return input; // Return original input if processing fails
-  //   }
-  // }
-
   const synthesizeSpeechWithPolly = async (text) => {
     if (!text) {
       console.error('No text provided for synthesis');
@@ -843,7 +722,6 @@ wss.on('connection', (ws) => {
       throw err;
     }
   };
-
   const synthesizeSpeechWithGabber = async (text) => {
     try {
       // console.log(process.env.GABBER_USAGETOKEN)
@@ -884,28 +762,4 @@ wss.on('connection', (ws) => {
       console.error('❌ Error:', decoded || err.message);
     }
   };
-
-  // const synthesizeSpeech = async (text, ws) => {
-  //   if (!text) return;
-
-  //   const params = {
-  //     Text: text,
-  //     VoiceId: "Joanna",
-  //     OutputFormat: "mp3"
-  //   };
-
-  //   const command = new SynthesizeSpeechCommand(params);
-  //   const data = await polly.send(command);
-
-  //   if (data.AudioStream) {
-  //     // AudioStream is a readable stream
-  //     const stream = data.AudioStream;
-  //     stream.on('data', (chunk) => {
-  //       ws.send(chunk); // Send each chunk as binary data
-  //     });
-  //     stream.on('end', () => {
-  //       ws.send(JSON.stringify({ type: 'end' })); // Signal end of stream
-  //     });
-  //   }
-  // };
 });
