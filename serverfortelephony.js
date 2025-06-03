@@ -79,21 +79,25 @@ async function convertMp3ToMulaw(mp3Buffer) {
   });
 }
 
-
+let interuption = false
 
 function streamMulawAudioToTwilio(ws, streamSid, mulawBuffer) {
-  const CHUNK_SIZE = 160; // 20ms for 8kHz mulaw
+  const CHUNK_SIZE = 1600; // 20ms for 8kHz mulaw
   let offset = 0;
   function sendChunk() {
     if (offset >= mulawBuffer.length) return;
     const chunk = mulawBuffer.slice(offset, offset + CHUNK_SIZE);
-    ws.send(JSON.stringify({
+    if(!interuption){
+      ws.send(JSON.stringify({
       event: 'media',
       streamSid,
       media: { payload: chunk.toString('base64') }
     }));
+    }else{
+      mulawBuffer = ""
+    }
     offset += CHUNK_SIZE;
-    setTimeout(sendChunk, 20);
+    setTimeout(sendChunk, 200);
   }
   sendChunk();
 }
@@ -126,11 +130,11 @@ const updateLatencyStats = (latency) => {
   }
 };
 
-// const pythonPath = 'C:/Users/shubh/miniconda3/envs/vad-env/python.exe';
+const pythonPath = 'C:/Users/shubh/miniconda3/envs/vad-env/python.exe';
 // const pythonPath2 = 'D:/work/ship-fast.studio/Test_bench/python_processes/venv/Scripts/python.exe';
 
 // Launch Python VAD script
-const vad = spawn('python3', ['vad.py']);
+const vad = spawn(pythonPath, ['vad.py']);
 
 // Spawn FFmpeg to decode audio to PCM with optimized settings
 const ffmpeg = spawn('ffmpeg', [
@@ -382,6 +386,7 @@ wss.on('connection', (ws) => {
                   const audioBuffer = await synthesizeSpeechWithPolly(processedText);
                   const mulawBuffer = await convertMp3ToMulaw(audioBuffer);
                   if (mulawBuffer) {
+                    streamMulawAudioToTwilio(mulawBuffer)
                     // const CHUNK_SIZE = 400; // 20ms for 8kHz mulaw
                     // let offset = 0;
 
@@ -401,11 +406,12 @@ wss.on('connection', (ws) => {
                     // }
 
                     // sendChunk(); // Start streaming
-                    ws.send(JSON.stringify({
-                        event: 'media',
-                        streamSid,
-                        media: { payload: mulawBuffer.toString('base64') }
-                      }));
+                    
+                    // ws.send(JSON.stringify({
+                    //     event: 'media',
+                    //     streamSid,
+                    //     media: { payload: mulawBuffer.toString('base64') }
+                    //   }));
                   }
 
                 } else {
@@ -484,9 +490,11 @@ wss.on('connection', (ws) => {
       if (parsed.event === 'speech_start') {
         isSpeechActive = true;
         console.log('Speech started');
+        interuption=true
       } else if (parsed.event === 'speech_end') {
         isSpeechActive = false;
         console.log('Speech ended');
+        interuption=false
         if (isSpeechActive === false && dgSocket?.readyState === WebSocket.OPEN) {
           // dgSocket.send(silenceBuffer)
           dgSocket.send(JSON.stringify({
@@ -569,18 +577,18 @@ wss.on('connection', (ws) => {
       streamSid = parsedData.streamSid
       console.log("strem started", streamSid)
       // console.log(parsedData)
-      // callSid = parsedData.start.callSid;
+      callSid = parsedData.start.callSid;
       // 1. Announcement text
-      // const announcementText = "Hello! You are speaking to an AI assistant.";
+      const announcementText = "Hello! You are speaking to an AI assistant.";
 
-      // // 2. Synthesize speech with Polly
-      // const mp3Buffer = await synthesizeSpeechWithPolly(announcementText);
+      // 2. Synthesize speech with Polly
+      const mp3Buffer = await synthesizeSpeechWithPolly(announcementText);
 
-      // // 3. Convert MP3 to mulaw 8kHz
-      // const mulawBuffer = await convertMp3ToMulaw(mp3Buffer);
+      // 3. Convert MP3 to mulaw 8kHz
+      const mulawBuffer = await convertMp3ToMulaw(mp3Buffer);
 
-      // // 4. Stream the announcement audio to Twilio
-      // streamMulawAudioToTwilio(ws, streamSid, mulawBuffer);
+      // 4. Stream the announcement audio to Twilio
+      streamMulawAudioToTwilio(ws, streamSid, mulawBuffer);
     }
   });
 
