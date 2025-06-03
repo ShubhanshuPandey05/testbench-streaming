@@ -126,8 +126,8 @@ const updateLatencyStats = (latency) => {
   }
 };
 
-const pythonPath = 'C:/Users/shubh/miniconda3/envs/vad-env/python.exe';
-const pythonPath2 = 'D:/work/ship-fast.studio/Test_bench/python_processes/venv/Scripts/python.exe';
+// const pythonPath = 'C:/Users/shubh/miniconda3/envs/vad-env/python.exe';
+// const pythonPath2 = 'D:/work/ship-fast.studio/Test_bench/python_processes/venv/Scripts/python.exe';
 
 // Launch Python VAD script
 const vad = spawn('python3', ['vad.py']);
@@ -241,7 +241,7 @@ function generateSilenceBuffer(durationMs, sampleRate = 16000) {
 // }
 
 async function isTurnComplete(messages) {
-  const python = spawn(pythonPath2, ['turn_detection.py']);
+  const python = spawn('python3', ['turn_detection.py']);
 
   python.stdin.write(JSON.stringify(messages));
   python.stdin.end();
