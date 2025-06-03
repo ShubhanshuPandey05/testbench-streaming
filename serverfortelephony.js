@@ -130,7 +130,7 @@ const pythonPath = 'C:/Users/shubh/miniconda3/envs/vad-env/python.exe';
 const pythonPath2 = 'D:/work/ship-fast.studio/Test_bench/python_processes/venv/Scripts/python.exe';
 
 // Launch Python VAD script
-const vad = spawn(pythonPath, ['vad.py']);
+const vad = spawn('python3', ['vad.py']);
 
 // Spawn FFmpeg to decode audio to PCM with optimized settings
 const ffmpeg = spawn('ffmpeg', [
