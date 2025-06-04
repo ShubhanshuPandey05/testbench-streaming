@@ -4,5 +4,5 @@ wav = read_audio('path_to_audio_file')
 speech_timestamps = get_speech_timestamps(
   wav,
   model,
-  return_seconds=True,
+  return_seconds=True,  # Return speech timestamps in seconds (default is samples)
 )

@@ -14,19 +14,6 @@ const App = () => {
   const analyserRef = useRef(null);
   const animationFrameRef = useRef(null);
   const transcriptEndRef = useRef(null);
-  const audioQueueRef = useRef([]);
-  const isPlayingRef = useRef(false);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const lastInterimTimeRef = useRef(0);
-  const INTERIM_THRESHOLD = 500;
-  const [chatMessages, setChatMessages] = useState([]);
-  const [chatInput, setChatInput] = useState('');
-  // const [isChatActive, setIsChatActive] = useState(false);
-  const [latency, setLatency] = useState({
-    llm: 0,
-    stt: 0,
-    tts: 0
-  });
 
   useEffect(() => {
     return () => {
@@ -62,7 +49,7 @@ const App = () => {
     const source = audioContextRef.current.createMediaStreamSource(stream);
     source.connect(analyserRef.current);
     analyserRef.current.fftSize = 256;
-
+    
     const updateAudioLevel = () => {
       const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
       analyserRef.current.getByteFrequencyData(dataArray);
@@ -70,91 +57,22 @@ const App = () => {
       setAudioLevel(average);
       animationFrameRef.current = requestAnimationFrame(updateAudioLevel);
     };
-
+    
     updateAudioLevel();
-  };
-
-  const playNextAudio = async () => {
-    if (audioQueueRef.current.length === 0 || isPlayingRef.current) {
-      return;
-    }
-
-    isPlayingRef.current = true;
-    const { audioData, isInterim } = audioQueueRef.current.shift();
-
-    try {
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      }
-
-      const audioBuffer = await audioContextRef.current.decodeAudioData(audioData);
-      const source = audioContextRef.current.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(audioContextRef.current.destination);
-
-      source.onended = () => {
-        isPlayingRef.current = false;
-        setIsPlaying(false);
-        playNextAudio();
-      };
-
-      setIsPlaying(true);
-      source.start(0);
-    } catch (err) {
-      console.error('Error playing audio:', err);
-      isPlayingRef.current = false;
-      setIsPlaying(false);
-      playNextAudio();
-    }
-  };
-
-  const queueAudio = (audioData, isInterim) => {
-    const now = Date.now();
-
-    // For interim results, check if enough time has passed since last interim
-    if (isInterim && now - lastInterimTimeRef.current < INTERIM_THRESHOLD) {
-      return;
-    }
-
-    if (isInterim) {
-      lastInterimTimeRef.current = now;
-    }
-
-    audioQueueRef.current.push({ audioData, isInterim });
-    if (!isPlayingRef.current) {
-      playNextAudio();
-    }
-  };
-
-  const handleChatSubmit = (e) => {
-    e.preventDefault();
-    setChatMessages([...chatMessages, { role: 'user', content: chatInput }]);
-    console.log('Sending chat message:', chatInput);
-    // console.log(wsRef.current);
-    wsRef.current.send(JSON.stringify({
-      type: 'chat',
-      message: chatInput
-    }));
-    setChatInput('');
-  };
-
-  const handleChatInput = (e) => {
-    setChatInput(e.target.value);
   };
 
   const startRecording = async () => {
     try {
       setError(null);
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true
-        }
+        } 
       });
       setupAudioAnalysis(stream);
-
-      // wsRef.current = new WebSocket('wss://a31a-2401-4900-1c80-9450-6c61-8e74-1d49-209a.ngrok-free.app');
+      
       wsRef.current = new WebSocket('ws://localhost:5001');
       let reconnectTimeout = null;
 
@@ -170,42 +88,20 @@ const App = () => {
           }
         };
 
-        mediaRecorderRef.current.start(50);
+        mediaRecorderRef.current.start(100);
         setRecording(true);
       };
 
       wsRef.current.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-
-          if (data.type === 'audio') {
-            // Convert base64 to ArrayBuffer
-            const binaryString = window.atob(data.audio);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-              bytes[i] = binaryString.charCodeAt(i);
-            }
-
-            // Queue the audio with its type (interim or final)
-            queueAudio(bytes.buffer, data.isFinal);
-            console.log('latency', data.latency);
-            setLatency({
-              llm: data.latency.llm,
-              stt: data.latency.stt,
-              tts: data.latency.tts
-            });
-          } else if (data.type === 'tts_error') {
-            console.error('TTS Error:', data.error);
-          } else if (data.transcript) {
+          if (data.transcript) {
             if (data.isInterim) {
               setInterimTranscript(data.transcript);
             } else {
               setTranscript(prev => prev + ' ' + data.transcript);
               setInterimTranscript('');
             }
-          } else if (data.type === 'text') {
-            console.log('text', data.text);
-            setChatMessages(prev => [...prev, { role: 'assistant', content: data.text }]);
           } else if (data.error) {
             setError(data.error);
           }
@@ -249,145 +145,53 @@ const App = () => {
     setTranscript('');
     setInterimTranscript('');
   };
-  // const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  // let audioQueue = [];
-  // let playing = false;
-
-  // // const ws = new WebSocket('ws://localhost:5001');
-  // wsRef.binaryType = 'arraybuffer';
-
-  // wsRef.current.onmessage = async (event) => {
-  //   if (typeof event.data === 'string') {
-  //     const msg = JSON.parse(event.data);
-  //     if (msg.type === 'end') return; // End of stream
-  //   } else {
-  //     audioQueue.push(event.data);
-  //     if (!playing) playNextChunk();
-  //   }
-  // };
-
-  // async function playNextChunk() {
-  //   if (audioQueue.length === 0) {
-  //     playing = false;
-  //     return;
-  //   }
-  //   playing = true;
-  //   const chunk = audioQueue.shift();
-  //   const audioBuffer = await audioContext.decodeAudioData(chunk);
-  //   const source = audioContext.createBufferSource();
-  //   source.buffer = audioBuffer;
-  //   source.connect(audioContext.destination);
-  //   source.onended = playNextChunk;
-  //   source.start();
-  // }
-
-
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 to-gray-800 text-white p-6">
-
-      {/* Header */}
-      <header className="mb-6 text-center">
-        <h1 className="text-3xl font-extrabold tracking-wide">🎙️ Voice Agent Dashboard</h1>
-        <p className="text-sm text-gray-400 mt-1">Monitor, Record & Interact</p>
-      </header>
-
-      {/* Status Card */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
-        <div className="bg-white/10 backdrop-blur-md p-4 rounded-xl border border-white/20 shadow-md">
-          <p className="text-sm text-gray-300">Connection</p>
-          <div className={`mt-1 text-lg font-bold ${isConnected ? 'text-green-400' : 'text-red-400'
-            }`}>
-            {isConnected ? 'Connected' : 'Disconnected'}
-          </div>
-          {error && <div className="mt-2 text-red-300 text-sm">{error}</div>}
-          {isPlaying && <div className="mt-2 text-blue-300 text-sm">Playing back...</div>}
+    <div className="app-container">
+      <div className="status-bar">
+        <div className={`connection-status ${isConnected ? 'connected' : 'disconnected'}`}>
+          {isConnected ? 'Connected' : 'Disconnected'}
         </div>
-
-        <div className="bg-white/10 backdrop-blur-md p-4 rounded-xl border border-white/20 shadow-md">
-          <p className="text-sm text-gray-300 mb-1">Audio Level</p>
-          <div className="w-full bg-gray-600 h-3 rounded-full overflow-hidden">
-            <div
-              className={`h-full transition-all duration-500 ${recording ? 'bg-green-500' : 'bg-gray-300'
-                }`}
-              style={{ width: `${audioLevel}%` }}
-            ></div>
-          </div>
-        </div>
-
-        <div className="bg-white/10 backdrop-blur-md p-4 rounded-xl border border-white/20 shadow-md">
-          <p className="text-sm text-gray-300">Latency (ms)</p>
-          <div className="mt-2 space-y-1">
-            <p><span className="text-gray-400">LLM:</span> {latency.llm}</p>
-            <p><span className="text-gray-400">STT:</span> {latency.stt}</p>
-            <p><span className="text-gray-400">TTS:</span> {latency.tts}</p>
-          </div>
-        </div>
+        {error && <div className="error-message">{error}</div>}
       </div>
 
-      {/* Controls */}
-      <div className="flex flex-wrap gap-4 mb-6 justify-center">
+      <div className="audio-visualizer">
+        <div 
+          className="audio-level" 
+          style={{ 
+            width: `${audioLevel}%`,
+            backgroundColor: recording ? '#4CAF50' : '#9e9e9e'
+          }}
+        />
+      </div>
+
+      <div className="controls">
         {recording ? (
-          <button
-            onClick={stopRecording}
-            className="bg-red-600 hover:bg-red-700 transition px-6 py-2 rounded-full font-semibold shadow"
-          >
-            ⏹ Stop Recording
+          <button className="stop-button" onClick={stopRecording}>
+            Stop Recording
           </button>
         ) : (
-          <button
-            onClick={startRecording}
-            className="bg-green-600 hover:bg-green-700 transition px-6 py-2 rounded-full font-semibold shadow"
-          >
-            🎙️ Start Recording
+          <button className="start-button" onClick={startRecording}>
+            Start Recording
           </button>
         )}
-        <button
-          onClick={clearTranscript}
-          className="bg-yellow-600 hover:bg-yellow-700 transition px-6 py-2 rounded-full font-semibold shadow"
-        >
-          🧹 Clear Transcript
+        <button className="clear-button" onClick={clearTranscript}>
+          Clear Transcript
         </button>
       </div>
 
-      {/* Transcript */}
-      <div className="bg-white/10 backdrop-blur-md p-6 rounded-xl border border-white/20 shadow-md mb-6">
-        <h2 className="text-2xl font-bold mb-2">📝 Transcript</h2>
-        <div className="text-gray-200 whitespace-pre-wrap break-words h-40 overflow-y-auto">
+      <div className="transcript-container">
+        <h2>Transcript</h2>
+        <div className="transcript">
           {transcript}
           {interimTranscript && (
-            <span className="italic text-gray-400">{interimTranscript}</span>
+            <span className="interim-text">{interimTranscript}</span>
           )}
           <div ref={transcriptEndRef} />
         </div>
       </div>
-
-      {/* Chat Section */}
-      <div className="bg-white/10 backdrop-blur-md p-6 rounded-xl border border-white/20 shadow-md">
-        <h2 className="text-2xl font-bold mb-4">💬 Chat</h2>
-        <div className="h-40 bg-white/5 rounded-lg overflow-y-auto p-3 mb-4 text-sm text-gray-200 border border-white/10">
-          <div className="chat-messages"></div>
-        </div>
-        <div className="flex gap-2">
-          <input
-            type="text"
-            placeholder="Type your message..."
-            value={chatInput}
-            onChange={handleChatInput}
-            className="flex-1 bg-white/10 text-white placeholder-gray-400 px-4 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"
-          />
-          <button
-            onClick={handleChatSubmit}
-            className="bg-blue-600 hover:bg-blue-700 transition px-5 py-2 rounded-lg font-semibold shadow"
-          >
-            Send
-          </button>
-        </div>
-      </div>
     </div>
   );
-
-
 };
 
 export default App;
