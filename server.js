@@ -4,6 +4,7 @@ require('dotenv').config();
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 const { PollyClient, SynthesizeSpeechCommand } = require("@aws-sdk/client-polly");
 const OpenAI = require("openai");
+const { full } = require('@huggingface/transformers');
 
 const wss = new WebSocket.Server({ port: 5001 });
 console.log("✅ WebSocket server started on ws://localhost:5001");
@@ -72,7 +73,7 @@ const pythonPath = 'C:/Users/shubh/miniconda3/envs/vad-env/python.exe';
 const pythonPath2 = 'D:/work/ship-fast.studio/Test_bench/python_processes/venv/Scripts/python.exe';
 
 // Launch Python VAD script
-const vad = spawn(pythonPath, ['vad.py']);
+const vad = spawn("python", ['vad.py']);
 
 // Spawn FFmpeg to decode audio to PCM with optimized settings
 const ffmpeg = spawn('ffmpeg', [
@@ -182,20 +183,16 @@ function generateSilenceBuffer(durationMs, sampleRate = 16000) {
 // }
 
 async function isTurnComplete(messages) {
-  const python = spawn(pythonPath2, ['turn_detection.py']);
-
-  python.stdin.write(JSON.stringify(messages));
-  python.stdin.end();
-
-  let data = '';
-  python.stdout.on('data', (chunk) => { data += chunk; });
-  python.stderr.on('data', (err) => { console.error('Python error:', err.toString()); });
-
-  python.on('close', (code) => {
-    console.log('Python output:', data);
+  const res = await fetch("http://127.0.0.1:8000/predict_eot", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages }),
   });
-}
 
+  const json = await res.json();
+  // console.log("EOT response:", json);
+  return json.eot;
+}
 
 let fullMessage = "";
 
@@ -314,140 +311,152 @@ wss.on('connection', (ws) => {
               }));
 
               // Here we will impliment the logic of turn detection
-              // try {
-              //   // console.log("calling turn detector")
-              //   fullMessage = `${fullMessage} ${finalTranscript}`;
-              //   // console.log(fullMessage)
-              //   const result = isTurnComplete(fullMessage);
-              //   console.log("Full message:", fullMessage)
-              //   if (result === true) {
-              //     // Process final transcript through LLM and then TTS
-              //     try {
-              //       console.log('Final transcript before LLM:', fullMessage);
-              //       const { processedText, outputType } = await processInput(`{message:${fullMessage}, type:'audio'}`);
-              //       // console.log('LLM processed text:', processedText);
-
-              //       // await synthesizeSpeech(processedText, ws);
-              //       if (outputType === 'audio') {
-              //         console.log("tts called")
-              //         const audioBuffer = await synthesizeSpeechWithPolly(processedText);
-              //         if (audioBuffer) {
-              //           // console.log("audio buffer")
-              //           ws.send(JSON.stringify({
-              //             type: 'audio',
-              //             audio: audioBuffer.toString('base64'),
-              //             isFinal: true,
-              //             latency: latencyObj
-              //           }));
-              //         }
-              //       } else {
-              //         ws.send(JSON.stringify({
-              //           type: 'text',
-              //           text: processedText,
-              //           isFinal: true,
-              //           latency: latencyObj
-              //         }));
-              //       }
-              //       // console.log('latency', latency);
-              //     } catch (err) {
-              //       console.error('Error in final processing:', err);
-              //       ws.send(JSON.stringify({
-              //         type: 'tts_error',
-              //         error: 'Failed to process or synthesize speech'
-              //       }));
-              //     }
-              //     fullMessage = ""
-              //   } else {
-              //     console.log("user may speak further but if not in 3 seconds we will continue with this message");
-              //     userSpeak = false
-              //     setTimeout(async() => {
-              //       if (userSpeak === false) {
-              //         try {
-              //           console.log('Final transcript before LLM:', finalTranscript);
-              //           const { processedText, outputType } = await processInput(`{message:${fullMessage}, type:'audio'}`);
-              //           // console.log('LLM processed text:', processedText);
-
-              //           // await synthesizeSpeech(processedText, ws);
-              //           if (outputType === 'audio') {
-              //             console.log("tts called")
-              //             const audioBuffer = await synthesizeSpeechWithPolly(processedText);
-              //             if (audioBuffer) {
-              //               // console.log("audio buffer")
-              //               ws.send(JSON.stringify({
-              //                 type: 'audio',
-              //                 audio: audioBuffer.toString('base64'),
-              //                 isFinal: true,
-              //                 latency: latencyObj
-              //               }));
-              //             }
-              //           } else {
-              //             ws.send(JSON.stringify({
-              //               type: 'text',
-              //               text: processedText,
-              //               isFinal: true,
-              //               latency: latencyObj
-              //             }));
-              //           }
-              //           // console.log('latency', latency);
-              //         } catch (err) {
-              //           console.error('Error in final processing:', err);
-              //           ws.send(JSON.stringify({
-              //             type: 'tts_error',
-              //             error: 'Failed to process or synthesize speech'
-              //           }));
-              //         }
-              //         fullMessage = ""
-              //       }
-              //     }, 3000)
-
-              //   }
-
-              // } catch (error) {
-              // }
-
-
-
               try {
-                console.log('Final transcript before LLM:', finalTranscript);
-                const { processedText, outputType } = await processInput(`{message:${finalTranscript}, type:'audio'}`);
-                // console.log('LLM processed text:', processedText);
+                
+                fullMessage = `${fullMessage} ${finalTranscript}`;
+                
+                message.push({
+                  role: "user",
+                  content: fullMessage
+                });
+                console.log("Full message:", message);
 
-                // await synthesizeSpeech(processedText, ws);
-                if (outputType === 'audio') {
-                  console.log("tts called")
-                  const audioBuffer = await synthesizeSpeechWithPolly(processedText);
-                  if (audioBuffer) {
-                    // console.log("audio buffer")
+                const result = await isTurnComplete(message);
+                // console.log("Full message:", fullMessage)
+                if (result === true) {
+                  // Process final transcript through LLM and then TTS
+                  try {
+                    console.log('Final transcript before LLM:', fullMessage);
+                    const { processedText, outputType } = await processInput(`{message:${fullMessage}, type:'audio'}`);
+                    // console.log('LLM processed text:', processedText);
+
+                    // await synthesizeSpeech(processedText, ws);
+                    if (outputType === 'audio') {
+                      console.log("tts called")
+                      const audioBuffer = await synthesizeSpeechWithPolly(processedText);
+                      if (audioBuffer) {
+                        // console.log("audio buffer")
+                        ws.send(JSON.stringify({
+                          type: 'audio',
+                          audio: audioBuffer.toString('base64'),
+                          isFinal: true,
+                          latency: latencyObj
+                        }));
+                      }
+                    } else {
+                      ws.send(JSON.stringify({
+                        type: 'text',
+                        text: processedText,
+                        isFinal: true,
+                        latency: latencyObj
+                      }));
+                    }
+                    // console.log('latency', latency);
+                  } catch (err) {
+                    console.error('Error in final processing:', err);
                     ws.send(JSON.stringify({
-                      type: 'audio',
-                      audio: audioBuffer.toString('base64'),
-                      isFinal: true,
-                      latency: latencyObj
+                      type: 'tts_error',
+                      error: 'Failed to process or synthesize speech'
                     }));
                   }
+                  fullMessage = ""
                 } else {
-                  ws.send(JSON.stringify({
-                    type: 'text',
-                    text: processedText,
-                    isFinal: true,
-                    latency: latencyObj
-                  }));
+                  console.log("user may speak further but if not in 3 seconds we will continue with this message");
+                  userSpeak = false
+                  setTimeout(async() => {
+                    if (userSpeak === false) {
+                      try {
+                        console.log('Final transcript before LLM:', finalTranscript);
+                        const { processedText, outputType } = await processInput(`{message:${fullMessage}, type:'audio'}`);
+                        // console.log('LLM processed text:', processedText);
+
+                        // await synthesizeSpeech(processedText, ws);
+                        if (outputType === 'audio') {
+                          console.log("tts called")
+                          const audioBuffer = await synthesizeSpeechWithPolly(processedText);
+                          if (audioBuffer) {
+                            // console.log("audio buffer")
+                            ws.send(JSON.stringify({
+                              type: 'audio',
+                              audio: audioBuffer.toString('base64'),
+                              isFinal: true,
+                              latency: latencyObj
+                            }));
+                          }
+                        } else {
+                          ws.send(JSON.stringify({
+                            type: 'text',
+                            text: processedText,
+                            isFinal: true,
+                            latency: latencyObj
+                          }));
+                        }
+                        // console.log('latency', latency);
+                      } catch (err) {
+                        console.error('Error in final processing:', err);
+                        ws.send(JSON.stringify({
+                          type: 'tts_error',
+                          error: 'Failed to process or synthesize speech'
+                        }));
+                      }
+                      fullMessage = ""
+                    }
+                  }, 3000)
+
                 }
-                // console.log('latency', latency);
-              } catch (err) {
-                console.error('Error in final processing:', err);
-                ws.send(JSON.stringify({
-                  type: 'tts_error',
-                  error: 'Failed to process or synthesize speech'
-                }));
+
+              } catch (error) {
               }
+
+
+
+              // try {
+              //   console.log('Final transcript before LLM:', finalTranscript);
+              //   const { processedText, outputType } = await processInput(`{message:${finalTranscript}, type:'audio'}`);
+              //   // console.log('LLM processed text:', processedText);
+
+              //   // await synthesizeSpeech(processedText, ws);
+              //   if (outputType === 'audio') {
+              //     console.log("tts called")
+              //     const audioBuffer = await synthesizeSpeechWithPolly(processedText);
+              //     if (audioBuffer) {
+              //       // console.log("audio buffer")
+              //       ws.send(JSON.stringify({
+              //         type: 'audio',
+              //         audio: audioBuffer.toString('base64'),
+              //         isFinal: true,
+              //         latency: latencyObj
+              //       }));
+              //     }
+              //   } else {
+              //     ws.send(JSON.stringify({
+              //       type: 'text',
+              //       text: processedText,
+              //       isFinal: true,
+              //       latency: latencyObj
+              //     }));
+              //   }
+              //   // console.log('latency', latency);
+              // } catch (err) {
+              //   console.error('Error in final processing:', err);
+              //   ws.send(JSON.stringify({
+              //     type: 'tts_error',
+              //     error: 'Failed to process or synthesize speech'
+              //   }));
+              // }
 
               // try {
               //   message.push({
               //     role: "user",
               //     content: finalTranscript
               //   })
-              //   isTurnComplete(message)
+              //   const fedData = {
+              //     role: "user",
+              //     content: finalTranscript
+              //   }
+
+              //   isTurnComplete(fedData)
+                
               // } catch (error) {
 
               // }
