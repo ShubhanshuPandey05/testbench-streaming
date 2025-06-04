@@ -95,6 +95,11 @@ class SessionManager {
       userSpeak: false,
       streamSid: '',
       callSid: '',
+      isAIResponding: false,
+      currentAudioStream: null,
+      interruption: false,
+      lastInterruptionTime: 0,
+      interruptionCooldown: 200,
       message: [{
         role: "system",
         content: `You are a helpful assistant. Always reply in JSON with two keys: 'output' (the answer) and 'outputType' (either 'text' or 'audio'). The prompt will be in the format of "{message:user_query, type:input_channel}". Choose outputType based on: 1) Usually match input channel unless user specifies otherwise or content is unsuitable, 2) Use 'text' for emails, code, etc.`
@@ -140,11 +145,13 @@ const audioUtils = {
   convertMp3ToMulaw(mp3Buffer) {
     return new Promise((resolve, reject) => {
       const ffmpeg = spawn('ffmpeg', [
-        '-i', 'pipe:0',         // Input from stdin
-        '-f', 'mulaw',          // Output format: mulaw
-        '-ar', '8000',          // Output sample rate: 8kHz
-        '-ac', '1',             // Mono
-        'pipe:1'                // Output to stdout
+        '-i', 'pipe:0',
+        '-f', 'mulaw',
+        '-ar', CONFIG.AUDIO_SAMPLE_RATE.toString(),
+        '-ac', '1',
+        '-acodec', 'pcm_mulaw',
+        '-y',
+        'pipe:1'
       ]);
 
       let mulawBuffer = Buffer.alloc(0);
@@ -154,13 +161,15 @@ const audioUtils = {
       });
 
       ffmpeg.stderr.on('data', (data) => {
-        // Optional: log ffmpeg errors
+        // console.log('FFmpeg stderr:', data.toString());
       });
 
       ffmpeg.on('close', (code) => {
         if (code === 0) {
+          // console.log('Audio conversion successful, buffer size:', mulawBuffer.length);
           resolve(mulawBuffer);
         } else {
+          console.error('FFmpeg process failed with code:', code);
           reject(new Error('ffmpeg process failed'));
         }
       });
@@ -170,28 +179,59 @@ const audioUtils = {
     });
   },
 
-
-  streamMulawAudioToTwilio(ws, streamSid, mulawBuffer) {
+  streamMulawAudioToTwilio: function(ws, streamSid, mulawBuffer, session) {
     const CHUNK_SIZE = 1600; // 20ms for 8kHz mulaw
     let offset = 0;
+    session.isAIResponding = true;
+    
+    // Create a more robust stop function
+    const stopFunction = () => {
+      console.log('Stopping audio stream...');
+      session.interruption = true;
+      session.isAIResponding = false;
+      offset = mulawBuffer.length; // Force stop by setting offset to end
+    };
+    
+    session.currentAudioStream = { stop: stopFunction };
 
-    // console.log(streamSid)
     function sendChunk() {
-      if (offset >= mulawBuffer.length) {
+      if (offset >= mulawBuffer.length || session.interruption) {
+        console.log('Audio stream ended or interrupted');
+        session.isAIResponding = false;
+        session.currentAudioStream = null;
         return;
       }
 
-      const chunk = mulawBuffer.slice(offset, offset + CHUNK_SIZE);
-      // console.log(`Sending chunk at offset: ${offset}`); // log this
-      ws.send(JSON.stringify({
-        event: 'media',
-        streamSid,
-        media: { payload: chunk.toString('base64') }
-      }));
-      offset += CHUNK_SIZE;
-      setTimeout(sendChunk, 200);
+      if (!session.interruption) {
+        const chunk = mulawBuffer.slice(offset, offset + CHUNK_SIZE);
+        try {
+          ws.send(JSON.stringify({
+            event: 'media',
+            streamSid,
+            media: { payload: chunk.toString('base64') }
+          }));
+          offset += CHUNK_SIZE;
+          setTimeout(sendChunk, 200);
+        } catch (error) {
+          console.error('Error sending audio chunk:', error);
+          stopFunction();
+        }
+      } else {
+        // Send a brief silence to ensure clean interruption
+        const silenceBuffer = this.generateSilenceBuffer(20);
+        try {
+          ws.send(JSON.stringify({
+            event: 'media',
+            streamSid,
+            media: { payload: silenceBuffer.toString('base64') }
+          }));
+        } catch (error) {
+          console.error('Error sending silence buffer:', error);
+        }
+        session.isAIResponding = false;
+        session.currentAudioStream = null;
+      }
     }
-
     sendChunk();
   }
 };
@@ -332,18 +372,12 @@ wss.on('connection', (ws) => {
           if (!received.is_final) {
             if (confidence >= CONFIG.INTERIM_CONFIDENCE_THRESHOLD &&
               (now - session.lastInterimTime >= CONFIG.INTERIM_TIME_THRESHOLD) &&
-              (session.isSpeaking || transcript.length > 2) &&
               transcript !== session.lastInterimTranscript) {
 
               session.isSpeaking = true;
               session.lastInterimTime = now;
               session.lastInterimTranscript = transcript;
               session.interimResultsBuffer.push(transcript);
-
-              // Only interrupt if there's significant speech
-              if (isAIResponding && transcript.length > 10) {
-                handleInterruption(session);
-              }
 
               ws.send(JSON.stringify({
                 transcript,
@@ -390,7 +424,7 @@ wss.on('connection', (ws) => {
                     console.error('Failed to synthesize speech');
                     return;
                   }
-                  console.log('Audio synthesized, converting to mulaw...');
+                  // console.log('Audio synthesized, converting to mulaw...');
                   const mulawBuffer = await audioUtils.convertMp3ToMulaw(audioBuffer);
                   if (mulawBuffer) {
                     // console.log('Starting audio response, buffer size:', mulawBuffer.length);
@@ -400,7 +434,7 @@ wss.on('connection', (ws) => {
                     //   streamSid: session.streamSid,
                     //   mark: { name: 'start_audio' }
                     // }));
-                    audioUtils.streamMulawAudioToTwilio(ws, session.streamSid, mulawBuffer);
+                    audioUtils.streamMulawAudioToTwilio(ws, session.streamSid, mulawBuffer, session);
 
                     // console.log("Audio", mulawBuffer)
                     // ws.send(JSON.stringify({
@@ -458,26 +492,48 @@ wss.on('connection', (ws) => {
   };
 
   const handleInterruption = async (session) => {
-    if (isAIResponding && currentAudioStream) {
-      console.log('Interruption detected - stopping current response');
-      currentAudioStream.stop();
-      currentAudioStream = null;
-      isAIResponding = false;
+    if (!session || !session.isAIResponding) return;
 
-      // Send a brief silence to ensure clean interruption
-      const silenceBuffer = audioUtils.generateSilenceBuffer(100);
-      ws.send(JSON.stringify({
-        event: 'media',
-        streamSid: session.streamSid,
-        media: { payload: silenceBuffer.toString('base64') }
-      }));
+    console.log('Handling interruption...');
+    
+    // Immediately stop any ongoing audio
+    if (session.currentAudioStream) {
+      try {
+        session.currentAudioStream.stop();
+      } catch (error) {
+        console.error('Error stopping audio stream:', error);
+      }
+      session.currentAudioStream = null;
     }
+    
+    // Force stop the audio stream by sending multiple silence buffers
+    for (let i = 0; i < 5; i++) {
+      const silenceBuffer = audioUtils.generateSilenceBuffer(20);
+      try {
+        ws.send(JSON.stringify({
+          event: 'media',
+          streamSid: session.streamSid,
+          media: { payload: silenceBuffer.toString('base64') }
+        }));
+      } catch (error) {
+        console.error('Error sending silence buffer:', error);
+      }
+    }
+
+    // Immediately set states
+    session.isAIResponding = false;
+    session.interruption = true;
+
+    // Reset interruption state after a very short delay
+    setTimeout(() => {
+      session.interruption = false;
+    }, 200);
   };
 
   connectToDeepgram();
 
   setInterval(() => {
-    if (!isSpeechActive) {
+    if (!isSpeechActive && session?.dgSocket?.readyState === WebSocket.OPEN) {
       session.dgSocket.send(JSON.stringify({ type: "KeepAlive" }));
     }
   }, 10000);
@@ -486,23 +542,34 @@ wss.on('connection', (ws) => {
     try {
       const parsed = JSON.parse(data.toString());
 
+      // Handle VAD events
       if (parsed.event === 'speech_start') {
         isSpeechActive = true;
-        interruption = true;
-        handleInterruption(session);
+        console.log('Speech started');
+        // Immediately interrupt if AI is responding
+        if (session?.isAIResponding) {
+          console.log('Interruption detected from VAD - stopping current response');
+          handleInterruption(session);
+        }
       } else if (parsed.event === 'speech_end') {
         isSpeechActive = false;
-        interruption = false;
-        if (!isSpeechActive && session.dgSocket?.readyState === WebSocket.OPEN) {
-          session.dgSocket.send(JSON.stringify({ type: "Finalize" }));
+        console.log('Speech ended');
+        if (session?.interruption) {
+          session.interruption = false;
+        }
+        if (isSpeechActive === false && session?.dgSocket?.readyState === WebSocket.OPEN) {
+          session.dgSocket.send(JSON.stringify({
+            "type": "Finalize"
+          }));
         }
       }
 
+      // Process audio chunks
       if (parsed.chunk) {
         const audioBuffer = Buffer.from(parsed.chunk, 'hex');
         deepgramBuffer = Buffer.concat([deepgramBuffer, audioBuffer]);
 
-        if (deepgramBuffer.length >= CONFIG.CHUNK_SIZE && session.dgSocket?.readyState === WebSocket.OPEN) {
+        if (deepgramBuffer.length >= CONFIG.CHUNK_SIZE && session?.dgSocket?.readyState === WebSocket.OPEN) {
           session.audioStartTime = Date.now();
           session.dgSocket.send(deepgramBuffer);
           deepgramBuffer = Buffer.alloc(0);
@@ -564,7 +631,7 @@ wss.on('connection', (ws) => {
         const mp3Buffer = await aiProcessing.synthesizeSpeech(announcementText);
         const mulawBuffer = await audioUtils.convertMp3ToMulaw(mp3Buffer);
         if (mulawBuffer) {
-          audioUtils.streamMulawAudioToTwilio(ws, session.streamSid, mulawBuffer);
+          audioUtils.streamMulawAudioToTwilio(ws, session.streamSid, mulawBuffer, session);
         }
       }
     } catch (err) {
