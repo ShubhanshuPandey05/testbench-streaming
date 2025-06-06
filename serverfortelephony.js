@@ -22,7 +22,7 @@ const CONFIG = {
   POLLY_VOICE_ID: "Joanna",
   POLLY_OUTPUT_FORMAT: "mp3",
   GPT_MODEL: "gpt-4o-mini",
-  GPT_MAX_TOKENS: 100,
+  GPT_MAX_TOKENS: 150,
   GPT_TEMPERATURE: 0.1
 };
 
@@ -100,10 +100,37 @@ class SessionManager {
       interruption: false,
       lastInterruptionTime: 0,
       interruptionCooldown: 200,
-      message: [{
-        role: "system",
-        content: `You are a helpful assistant. Always reply in JSON with two keys: 'output' (the answer) and 'outputType' (either 'text' or 'audio'). The prompt will be in the format of "{message:user_query, type:input_channel}". Choose outputType based on: 1) Usually match input channel unless user specifies otherwise or content is unsuitable, 2) Use 'text' for emails, code, etc.`
+      currentMessage : {},
+      chatHistory: [{
+        A: "Hello! You are speaking to an AI assistant."
       }],
+      prompt: `
+You are the help full assistance. You have to generate the response in the JSON format which will contain 2 major parts 1) response, 2) output channel for an example:
+{
+	"response" : "You response for the user message",
+	"output_channel" : "output channel"
+}
+
+Here the output channel will be the medium of the response in which the user will get the response.
+Here currently you have two channels for the response 1)audio.
+
+For the output channel always prioritise the input channel but if the response is sensitive or not suitable for that medium of response then check for the available channels and select from that
+
+The user message will be a JSON object consist of two things 1)message, 2)input channel for an example
+{
+	"message" : "User message",
+	"input_channel" : "input channel"
+}
+
+I will provide you the chat history and the current message of the user.
+The chat history will be in the sturcture like 
+[{
+  A: "Assistant Message",
+},
+{
+  U: "UserMessage"
+}]
+`,
       metrics: { llm: 0, stt: 0, tts: 0 }
     };
     this.sessions.set(sessionId, session);
@@ -179,11 +206,11 @@ const audioUtils = {
     });
   },
 
-  streamMulawAudioToTwilio: function(ws, streamSid, mulawBuffer, session) {
+  streamMulawAudioToTwilio: function (ws, streamSid, mulawBuffer, session) {
     const CHUNK_SIZE = 1600; // 20ms for 8kHz mulaw
     let offset = 0;
     session.isAIResponding = true;
-    
+
     // Create a more robust stop function
     const stopFunction = () => {
       console.log('Stopping audio stream...');
@@ -191,7 +218,7 @@ const audioUtils = {
       session.isAIResponding = false;
       offset = mulawBuffer.length; // Force stop by setting offset to end
     };
-    
+
     session.currentAudioStream = { stop: stopFunction };
 
     function sendChunk() {
@@ -240,7 +267,10 @@ const audioUtils = {
 const aiProcessing = {
   async processInput(input, session) {
     try {
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      session.currentMessage = input
+      session.chatHistory.push({U:input.message})
+      // console.log(session.message)
+      const response = await fetch('https://api.openai.com/v1/responses', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -248,8 +278,8 @@ const aiProcessing = {
         },
         body: JSON.stringify({
           model: CONFIG.GPT_MODEL,
-          messages: [...session.message, { role: "user", content: input }],
-          max_tokens: CONFIG.GPT_MAX_TOKENS,
+          instructions: session.prompt,
+          input: JSON.stringify({chatHistory:session.chatHistory,currentMessage:session.currentmessage}),
           temperature: CONFIG.GPT_TEMPERATURE
         })
       });
@@ -257,20 +287,25 @@ const aiProcessing = {
       const data = await response.json();
       const latency = Date.now() - session.audioStartTime;
       session.metrics.llm = latency;
-
+      // console.log(data)
       try {
-        const parsedData = JSON.parse(data.choices[0].message.content);
-        session.message.push({
-          role: "assistant",
-          content: parsedData.output
+        console.log("jsonoutput : ",data.output[0].content[0].text)
+        const parsedData = JSON.parse(data.output[0].content[0].text);
+        session.chatHistory.push({
+          A: parsedData.response
         });
-        console.log("Parsed data of LLM response : ", parsedData.output);
-        return { processedText: parsedData.output, outputType: parsedData.outputType };
+        console.log("Parsed data of LLM response : ", parsedData.response);
+        console.log("Parsed data of LLM output channel : ", parsedData.output_channel);
+        return { processedText: parsedData.response, outputType: parsedData.output_channel };
       } catch (error) {
+        console.log(data)
+        session.chatHistory.push({
+          A: data.choices[0].message.content
+        });
         console.error('Error parsing LLM response:', error);
         console.log("LLM response :", data.choices[0].message.content)
         return {
-          processedText: data.choices[0].message.content || input,
+          processedText: data.choices[0].message.content || "Sorry for the inconvineance i didn't understand you request contact developer",
           outputType: 'audio'
         };
       }
@@ -413,7 +448,7 @@ wss.on('connection', (ws) => {
               try {
                 console.log("Final transcript : ", finalTranscript)
                 const { processedText, outputType } = await aiProcessing.processInput(
-                  `{message:${finalTranscript}, type:'audio'}`,
+                  { message: finalTranscript, input_channel: 'audio' },
                   session
                 );
 
@@ -495,7 +530,7 @@ wss.on('connection', (ws) => {
     if (!session || !session.isAIResponding) return;
 
     console.log('Handling interruption...');
-    
+
     // Immediately stop any ongoing audio
     if (session.currentAudioStream) {
       try {
@@ -505,7 +540,7 @@ wss.on('connection', (ws) => {
       }
       session.currentAudioStream = null;
     }
-    
+
     // Force stop the audio stream by sending multiple silence buffers
     for (let i = 0; i < 5; i++) {
       const silenceBuffer = audioUtils.generateSilenceBuffer(20);
