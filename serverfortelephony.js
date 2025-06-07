@@ -1,27 +1,29 @@
 // Core Dependencies
 const { spawn } = require('child_process');
 const WebSocket = require('ws');
-require('dotenv').config();
-const { createClient } = require('@deepgram/sdk');
+require('dotenv').config(); // Make sure your .env file has all the necessary keys
 const { PollyClient, SynthesizeSpeechCommand } = require("@aws-sdk/client-polly");
 const OpenAI = require("openai");
-const twilio = require('twilio');
-const fs = require('fs');
+const twilio = require('twilio'); // This might not be directly used in the WebSocket server, but kept for consistency
+const fs = require('fs'); // Not used in this version, but kept for consistency
+
+
+const pythonPath = 'C:/Users/shubh/miniconda3/envs/vad-env/python.exe';
 
 // Configuration Constants
 const CONFIG = {
   MAX_RECONNECT_ATTEMPTS: 5,
   RECONNECT_DELAY: 1000,
-  SILENCE_THRESHOLD: 500,
+  SILENCE_THRESHOLD: 500, // Not actively used in this VAD logic, but kept
   INTERIM_CONFIDENCE_THRESHOLD: 0.7,
   INTERIM_TIME_THRESHOLD: 10,
-  CHUNK_SIZE: 6400,
-  AUDIO_CHUNK_SIZE: 1600,
-  SAMPLE_RATE: 16000,
-  AUDIO_SAMPLE_RATE: 8000,
+  CHUNK_SIZE: 6400, // Audio chunk size for Deepgram (linear16, 16khz)
+  AUDIO_CHUNK_SIZE: 1600, // Mulaw audio chunk size for Twilio (8khz)
+  SAMPLE_RATE: 16000, // Sample rate for Deepgram and internal processing (linear16)
+  AUDIO_SAMPLE_RATE: 8000, // Sample rate for Twilio (mulaw)
   POLLY_VOICE_ID: "Joanna",
   POLLY_OUTPUT_FORMAT: "mp3",
-  GPT_MODEL: "gpt-4o-mini",
+  GPT_MODEL: "gpt-4o-mini", // Changed to the specified model
   GPT_MAX_TOKENS: 150,
   GPT_TEMPERATURE: 0.1
 };
@@ -32,14 +34,14 @@ const services = {
   polly: new PollyClient({
     region: "us-east-1",
     credentials: {
-      accessKeyId: process.env.accessKeyId,
+      accessKeyId: process.env.accessKeyId, // Ensure these env vars are correctly named
       secretAccessKey: process.env.secretAccessKey,
     },
   }),
-  openai: new OpenAI({ apiKey: process.env.OPEN_AI })
+  openai: new OpenAI({ apiKey: process.env.OPEN_AI }) // Ensure this env var is correctly named
 };
 
-// Performance Monitoring
+// Performance Monitoring (Global, as it aggregates stats from all sessions)
 const performance = {
   latency: {
     total: 0,
@@ -57,12 +59,12 @@ const performance = {
     const now = Date.now();
     if (now - this.latency.lastUpdate >= 5000) {
       const avg = this.latency.total / this.latency.count;
-      console.log('\n=== Performance Metrics ===');
+      console.log('\n=== Global Performance Metrics ===');
       console.log(`Average Latency: ${avg.toFixed(2)}ms`);
       console.log(`Min Latency: ${this.latency.min.toFixed(2)}ms`);
       console.log(`Max Latency: ${this.latency.max.toFixed(2)}ms`);
       console.log(`Total Samples: ${this.latency.count}`);
-      console.log('==========================\n');
+      console.log('==================================\n');
 
       this.latency.total = 0;
       this.latency.count = 0;
@@ -76,64 +78,72 @@ const performance = {
 // Session Management
 class SessionManager {
   constructor() {
-    this.sessions = new Map();
+    this.sessions = new Map(); // Stores active sessions by streamSid
   }
 
-  createSession(sessionId) {
+  createSession(sessionId, ws) {
+    if (this.sessions.has(sessionId)) {
+      console.warn(`Session ${sessionId} already exists, re-creating.`);
+      this.cleanupSession(sessionId); // Clean up existing one if it somehow exists
+    }
+
     const session = {
       id: sessionId,
-      dgSocket: null,
+      ws: ws, // Store the Twilio WebSocket for sending media
+      dgSocket: null, // Deepgram WebSocket
       reconnectAttempts: 0,
       lastTranscript: '',
       transcriptBuffer: [],
       silenceTimer: null,
-      audioStartTime: null,
+      audioStartTime: null, // For latency measurement
       lastInterimTime: Date.now(),
-      isSpeaking: false,
+      isSpeaking: false, // User speaking status
       lastInterimTranscript: '',
       interimResultsBuffer: [],
-      userSpeak: false,
-      streamSid: '',
-      callSid: '',
-      isAIResponding: false,
-      currentAudioStream: null,
-      interruption: false,
+      userSpeak: false, // Flag when user has finished speaking
+      streamSid: sessionId,
+      callSid: '', // Will be populated from Twilio 'start' event
+      isAIResponding: false, // AI currently speaking
+      currentAudioStream: null, // Reference to the outgoing audio stream function
+      interruption: false, // Flag for user interruption during AI speech
       lastInterruptionTime: 0,
       interruptionCooldown: 200,
-      currentMessage : {},
+      currentMessage: {},
       chatHistory: [{
         A: "Hello! You are speaking to an AI assistant."
       }],
+      // AI prompt, specific to each session
       prompt: `
-You are the help full assistance. You have to generate the response in the JSON format which will contain 2 major parts 1) response, 2) output channel for an example:
+You are a helpful assistant. Generate your response in JSON format containing two major parts: 1) "response" (your textual reply) and 2) "output_channel" (the medium for the response). For example:
 {
-	"response" : "You response for the user message",
-	"output_channel" : "output channel"
+  "response": "Your response for the user message",
+  "output_channel": "audio"
 }
 
-Here the output channel will be the medium of the response in which the user will get the response.
-Here currently you have two channels for the response 1)audio.
+The "output_channel" must be one of the available channels. Currently, only "audio" is available. Always prioritize the input channel if suitable for the response.
 
-For the output channel always prioritise the input channel but if the response is sensitive or not suitable for that medium of response then check for the available channels and select from that
-
-The user message will be a JSON object consist of two things 1)message, 2)input channel for an example
+The user's message will be a JSON object with "message" and "input_channel". For example:
 {
-	"message" : "User message",
-	"input_channel" : "input channel"
+  "message": "User's message",
+  "input_channel": "audio"
 }
 
-I will provide you the chat history and the current message of the user.
-The chat history will be in the sturcture like 
-[{
-  A: "Assistant Message",
-},
-{
-  U: "UserMessage"
-}]
+I will provide you with the chat history and the current user message. The chat history will be structured like this:
+[
+  { "A": "Assistant Message" },
+  { "U": "User Message" }
+]
 `,
-      metrics: { llm: 0, stt: 0, tts: 0 }
+      metrics: { llm: 0, stt: 0, tts: 0 },
+
+      // Per-session child processes for audio handling
+      ffmpegProcess: null,
+      vadProcess: null,
+      vadDeepgramBuffer: Buffer.alloc(0), // Buffer for audio chunks after VAD/FFmpeg processing
+      isVadSpeechActive: false, // VAD's internal speech detection status
     };
     this.sessions.set(sessionId, session);
+    console.log(`Session ${sessionId}: Created new session.`);
     return session;
   }
 
@@ -146,6 +156,7 @@ The chat history will be in the sturcture like
     if (session) {
       this.cleanupSession(sessionId);
       this.sessions.delete(sessionId);
+      console.log(`Session ${sessionId}: Deleted session.`);
     }
   }
 
@@ -154,31 +165,50 @@ The chat history will be in the sturcture like
     if (session) {
       if (session.dgSocket?.readyState === WebSocket.OPEN) {
         session.dgSocket.close();
+        console.log(`Session ${sessionId}: Closed Deepgram socket.`);
       }
       if (session.silenceTimer) {
         clearTimeout(session.silenceTimer);
+        session.silenceTimer = null;
       }
+      // Terminate child processes
+      if (session.ffmpegProcess) {
+        session.ffmpegProcess.stdin.end(); // End stdin to allow process to exit gracefully
+        session.ffmpegProcess.kill('SIGINT'); // Send SIGINT to gracefully terminate
+        console.log(`Session ${sessionId}: Terminated ffmpeg process.`);
+      }
+      if (session.vadProcess) {
+        session.vadProcess.stdin.end(); // End stdin
+        session.vadProcess.kill('SIGINT'); // Send SIGINT
+        console.log(`Session ${sessionId}: Terminated VAD process.`);
+      }
+      // Ensure any ongoing audio streaming is stopped
+      if (session.currentAudioStream && typeof session.currentAudioStream.stop === 'function') {
+        session.currentAudioStream.stop();
+      }
+      session.isAIResponding = false;
     }
   }
 }
 
 // Audio Processing Utilities
 const audioUtils = {
-  generateSilenceBuffer: (durationMs, sampleRate = CONFIG.SAMPLE_RATE) => {
+  generateSilenceBuffer: (durationMs, sampleRate = CONFIG.AUDIO_SAMPLE_RATE) => {
+    // Generates a buffer of silence for mulaw 8khz, 1 channel
     const numSamples = Math.floor((durationMs / 1000) * sampleRate);
-    return Buffer.alloc(numSamples * 2);
+    return Buffer.alloc(numSamples); // mulaw is 8-bit, so 1 byte per sample
   },
 
-  convertMp3ToMulaw(mp3Buffer) {
+  convertMp3ToMulaw(mp3Buffer, sessionId) {
     return new Promise((resolve, reject) => {
       const ffmpeg = spawn('ffmpeg', [
-        '-i', 'pipe:0',
-        '-f', 'mulaw',
-        '-ar', CONFIG.AUDIO_SAMPLE_RATE.toString(),
-        '-ac', '1',
-        '-acodec', 'pcm_mulaw',
-        '-y',
-        'pipe:1'
+        '-i', 'pipe:0', // Input from stdin
+        '-f', 'mulaw', // Output format
+        '-ar', CONFIG.AUDIO_SAMPLE_RATE.toString(), // Output sample rate
+        '-ac', '1', // Output channels
+        '-acodec', 'pcm_mulaw', // Output codec
+        '-y', // Overwrite output files without asking
+        'pipe:1' // Output to stdout
       ]);
 
       let mulawBuffer = Buffer.alloc(0);
@@ -188,17 +218,22 @@ const audioUtils = {
       });
 
       ffmpeg.stderr.on('data', (data) => {
-        // console.log('FFmpeg stderr:', data.toString());
+        // console.log(`Session ${sessionId}: FFmpeg stderr for conversion:`, data.toString());
       });
 
       ffmpeg.on('close', (code) => {
         if (code === 0) {
-          // console.log('Audio conversion successful, buffer size:', mulawBuffer.length);
+          // console.log(`Session ${sessionId}: Audio conversion successful, buffer size:`, mulawBuffer.length);
           resolve(mulawBuffer);
         } else {
-          console.error('FFmpeg process failed with code:', code);
-          reject(new Error('ffmpeg process failed'));
+          console.error(`Session ${sessionId}: FFmpeg process failed with code ${code} during MP3 to Mulaw conversion.`);
+          reject(new Error(`ffmpeg process failed with code ${code}`));
         }
+      });
+
+      ffmpeg.on('error', (err) => {
+        console.error(`Session ${sessionId}: FFmpeg process error during MP3 to Mulaw conversion:`, err);
+        reject(err);
       });
 
       ffmpeg.stdin.write(mp3Buffer);
@@ -207,59 +242,52 @@ const audioUtils = {
   },
 
   streamMulawAudioToTwilio: function (ws, streamSid, mulawBuffer, session) {
-    const CHUNK_SIZE = 1600; // 20ms for 8kHz mulaw
+    const CHUNK_SIZE_MULAW = 1600; // 20ms of 8khz mulaw (8000 samples/sec * 0.020 sec = 160 samples, 1 byte/sample)
     let offset = 0;
     session.isAIResponding = true;
+    session.interruption = false; // Reset interruption flag when AI starts speaking
 
-    // Create a more robust stop function
     const stopFunction = () => {
-      console.log('Stopping audio stream...');
-      session.interruption = true;
+      console.log(`Session ${session.id}: Stopping outgoing audio stream...`);
+      session.interruption = true; // Mark for immediate stop
       session.isAIResponding = false;
       offset = mulawBuffer.length; // Force stop by setting offset to end
+      session.currentAudioStream = null; // Clear reference
     };
 
-    session.currentAudioStream = { stop: stopFunction };
+    session.currentAudioStream = { stop: stopFunction }; // Store stop function for external interruption
 
     function sendChunk() {
       if (offset >= mulawBuffer.length || session.interruption) {
-        console.log('Audio stream ended or interrupted');
+        console.log(`Session ${session.id}: Audio stream ended or interrupted.`);
         session.isAIResponding = false;
         session.currentAudioStream = null;
         return;
       }
 
-      if (!session.interruption) {
-        const chunk = mulawBuffer.slice(offset, offset + CHUNK_SIZE);
-        try {
-          ws.send(JSON.stringify({
-            event: 'media',
-            streamSid,
-            media: { payload: chunk.toString('base64') }
-          }));
-          offset += CHUNK_SIZE;
-          setTimeout(sendChunk, 200);
-        } catch (error) {
-          console.error('Error sending audio chunk:', error);
-          stopFunction();
-        }
-      } else {
-        // Send a brief silence to ensure clean interruption
-        const silenceBuffer = this.generateSilenceBuffer(20);
-        try {
-          ws.send(JSON.stringify({
-            event: 'media',
-            streamSid,
-            media: { payload: silenceBuffer.toString('base64') }
-          }));
-        } catch (error) {
-          console.error('Error sending silence buffer:', error);
-        }
+      const chunk = mulawBuffer.slice(offset, offset + CHUNK_SIZE_MULAW);
+      if (chunk.length === 0) { // Handle case where the last chunk is empty
+        console.log(`Session ${session.id}: Last chunk is empty, ending stream.`);
         session.isAIResponding = false;
         session.currentAudioStream = null;
+        return;
+      }
+
+      try {
+        ws.send(JSON.stringify({
+          event: 'media',
+          streamSid,
+          media: { payload: chunk.toString('base64') }
+        }));
+        offset += CHUNK_SIZE_MULAW;
+        // Schedule next chunk slightly faster than chunk duration for continuous flow
+        setTimeout(sendChunk, 180); // 180ms delay for 200ms chunk
+      } catch (error) {
+        console.error(`Session ${session.id}: Error sending audio chunk:`, error);
+        stopFunction(); // Stop on error
       }
     }
-    sendChunk();
+    sendChunk(); // Start sending chunks
   }
 };
 
@@ -267,60 +295,57 @@ const audioUtils = {
 const aiProcessing = {
   async processInput(input, session) {
     try {
-      session.currentMessage = input
-      session.chatHistory.push({U:input.message})
-      // console.log(session.message)
-      const response = await fetch('https://api.openai.com/v1/responses', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.OPEN_AI}`
-        },
-        body: JSON.stringify({
-          model: CONFIG.GPT_MODEL,
-          instructions: session.prompt,
-          input: JSON.stringify({chatHistory:session.chatHistory,currentMessage:session.currentmessage}),
-          temperature: CONFIG.GPT_TEMPERATURE
-        })
-      });
+      session.currentMessage = input;
+      session.chatHistory.push({ U: input.message });
 
-      const data = await response.json();
-      const latency = Date.now() - session.audioStartTime;
+      // Prepare messages for OpenAI
+      const messages = [
+        { role: "system", content: session.prompt },
+        { role: "user", content: JSON.stringify({ chatHistory: session.chatHistory, currentMessage: session.currentMessage }) }
+      ];
+
+      const startTime = Date.now();
+      const response = await services.openai.chat.completions.create({
+        model: CONFIG.GPT_MODEL,
+        messages: messages,
+        temperature: CONFIG.GPT_TEMPERATURE,
+        max_tokens: CONFIG.GPT_MAX_TOKENS,
+        response_format: { type: "json_object" } // Request JSON object directly
+      });
+      const latency = Date.now() - startTime;
       session.metrics.llm = latency;
-      // console.log(data)
+
+      let parsedData;
       try {
-        console.log("jsonoutput : ",data.output[0].content[0].text)
-        const parsedData = JSON.parse(data.output[0].content[0].text);
-        session.chatHistory.push({
-          A: parsedData.response
-        });
-        console.log("Parsed data of LLM response : ", parsedData.response);
-        console.log("Parsed data of LLM output channel : ", parsedData.output_channel);
+        parsedData = JSON.parse(response.choices[0].message.content);
+        console.log(`Session ${session.id}: LLM Raw Response:`, response.choices[0].message.content);
+        console.log(`Session ${session.id}: Parsed LLM response:`, parsedData.response);
+        console.log(`Session ${session.id}: Parsed LLM output channel:`, parsedData.output_channel);
+        session.chatHistory.push({ A: parsedData.response });
         return { processedText: parsedData.response, outputType: parsedData.output_channel };
       } catch (error) {
-        console.log(data)
-        session.chatHistory.push({
-          A: data.choices[0].message.content
-        });
-        console.error('Error parsing LLM response:', error);
-        console.log("LLM response :", data.choices[0].message.content)
+        console.error(`Session ${session.id}: Error parsing LLM JSON response:`, error);
+        console.log(`Session ${session.id}: Attempting to use raw LLM content:`, response.choices[0].message.content);
+        session.chatHistory.push({ A: response.choices[0].message.content });
+        // Fallback if JSON parsing fails
         return {
-          processedText: data.choices[0].message.content || "Sorry for the inconvineance i didn't understand you request contact developer",
-          outputType: 'audio'
+          processedText: response.choices[0].message.content || "Sorry, I had trouble understanding. Could you please rephrase?",
+          outputType: 'audio' // Default to audio if parsing fails
         };
       }
     } catch (error) {
-      console.error('Error processing input:', error);
-      return { processedText: input, outputType: 'text' };
+      console.error(`Session ${session.id}: Error processing input with OpenAI:`, error);
+      // Fallback for API errors
+      return { processedText: "I'm having trouble connecting right now. Please try again later.", outputType: 'audio' };
     }
   },
 
-  async synthesizeSpeech(text) {
+  async synthesizeSpeech(text, sessionId) {
     if (!text) {
-      console.error('No text provided for synthesis');
+      console.error(`Session ${sessionId}: No text provided for synthesis.`);
       return null;
     }
-
+    const startTime = Date.now();
     try {
       const command = new SynthesizeSpeechCommand({
         Text: text,
@@ -330,11 +355,17 @@ const aiProcessing = {
 
       const data = await services.polly.send(command);
       if (data.AudioStream) {
-        return Buffer.from(await data.AudioStream.transformToByteArray());
+        const audioBuffer = Buffer.from(await data.AudioStream.transformToByteArray());
+        const latency = Date.now() - startTime;
+        // Assuming session.metrics is accessible or passed
+        // For simplicity, directly updating global performance if metrics are for overall TTS
+        // performance.updateStats(latency); // If you want to track TTS latency globally
+        console.log(`Session ${sessionId}: TTS Latency: ${latency}ms`);
+        return audioBuffer;
       }
-      throw new Error("AudioStream not found in response");
+      throw new Error("AudioStream not found in Polly response.");
     } catch (err) {
-      console.error("Speech synthesis error:", err);
+      console.error(`Session ${sessionId}: Speech synthesis error with Polly:`, err);
       throw err;
     }
   }
@@ -344,353 +375,389 @@ const aiProcessing = {
 const wss = new WebSocket.Server({ port: 5001 });
 console.log("✅ WebSocket server started on ws://localhost:5001");
 
-// Initialize Audio Processing
-const pythonPath = 'C:/Users/shubh/miniconda3/envs/vad-env/python.exe';
-const vad = spawn(pythonPath, ['vad.py']);
-const ffmpeg = spawn('ffmpeg', [
-  '-loglevel', 'quiet',
-  '-f', 'mulaw',
-  '-ar', CONFIG.AUDIO_SAMPLE_RATE.toString(),
-  '-ac', '1',
-  '-i', 'pipe:0',
-  '-f', 's16le',
-  '-acodec', 'pcm_s16le',
-  '-ar', CONFIG.SAMPLE_RATE.toString(),
-  'pipe:1'
-]);
-
-ffmpeg.stdout.pipe(vad.stdin);
-
 // Session Management Instance
 const sessionManager = new SessionManager();
 
 // WebSocket Connection Handler
 wss.on('connection', (ws) => {
-  console.log("🎧 Client connected");
-  let sessionId = null;
-  let session = null;
-  let interruption = false;
-  let deepgramBuffer = Buffer.alloc(0);
-  let isSpeechActive = false;
-  let currentAudioStream = null;
-  let isAIResponding = false;
+  console.log("🎧 New Twilio client connected.");
+  let sessionId = null; // Will be set once 'start' event is received
+  let session = null; // Reference to the session object
 
-  const connectToDeepgram = () => {
-    if (!sessionId) return; // Don't connect until we have a streamSid
+  // Global interval to keep Deepgram connections alive for ALL active sessions
+  const deepgramKeepAliveInterval = setInterval(() => {
+    sessionManager.sessions.forEach(s => {
+      if (s.dgSocket?.readyState === WebSocket.OPEN) {
+        s.dgSocket.send(JSON.stringify({ type: "KeepAlive" }));
+      }
+    });
+  }, 10000); // Send keep-alive every 10 seconds
 
-    if (session.dgSocket) {
-      session.dgSocket.close();
+  // Function to establish Deepgram connection for a specific session
+  const connectToDeepgram = (currentSession) => {
+    if (!currentSession || !currentSession.id) {
+      console.error('Attempted to connect to Deepgram without a valid session.');
+      return;
     }
 
-    session.dgSocket = new WebSocket(
-      `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=${CONFIG.SAMPLE_RATE}&channels=1&model=nova-3&language=en&punctuate=true&interim_results=true&endpointing=100`,
-      ['token', process.env.DEEPGRAM_API]
-    );
+    if (currentSession.dgSocket && currentSession.dgSocket.readyState === WebSocket.OPEN) {
+      currentSession.dgSocket.close(); // Close existing socket if open
+    }
 
-    session.dgSocket.on('open', () => {
-      console.log(`✅ Deepgram connected for session ${sessionId}`);
-      session.reconnectAttempts = 0;
+    currentSession.dgSocket = new WebSocket(
+      `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=${CONFIG.SAMPLE_RATE}&channels=1&model=nova-3&language=en&punctuate=true&interim_results=true&endpointing=50`,
+      ['token', `${process.env.DEEPGRAM_API}`]
+    );
+    currentSession.dgSocket.on('open', () => {
+      console.log(`Session ${currentSession.id}: ✅ Deepgram connected.`);
+      currentSession.reconnectAttempts = 0;
     });
 
-    session.dgSocket.on('message', async (data) => {
+    currentSession.dgSocket.on('message', async (data) => {
       try {
         const received = JSON.parse(data);
+
+        // Update global performance metrics based on Deepgram final results
+        if (received.is_final && currentSession.audioStartTime) {
+          performance.updateStats(Date.now() - currentSession.audioStartTime);
+          currentSession.audioStartTime = null; // Reset for next utterance
+        }
+
         if (received.channel?.alternatives?.[0]?.transcript) {
           const transcript = received.channel.alternatives[0].transcript;
           const confidence = received.channel?.alternatives?.[0]?.confidence || 0;
           const now = Date.now();
 
-          if (session.audioStartTime) {
-            performance.updateStats(now - session.audioStartTime);
-          }
-
           if (!received.is_final) {
             if (confidence >= CONFIG.INTERIM_CONFIDENCE_THRESHOLD &&
-              (now - session.lastInterimTime >= CONFIG.INTERIM_TIME_THRESHOLD) &&
-              transcript !== session.lastInterimTranscript) {
+              (now - currentSession.lastInterimTime >= CONFIG.INTERIM_TIME_THRESHOLD) &&
+              transcript !== currentSession.lastInterimTranscript &&
+              transcript.trim().length > 0) { // Only process non-empty interim transcripts
 
-              session.isSpeaking = true;
-              session.lastInterimTime = now;
-              session.lastInterimTranscript = transcript;
-              session.interimResultsBuffer.push(transcript);
+              currentSession.isSpeaking = true;
+              currentSession.lastInterimTime = now;
+              currentSession.lastInterimTranscript = transcript;
+              currentSession.interimResultsBuffer.push(transcript);
 
+              // Send interim transcript back to the Twilio stream (e.g., for display/debugging)
+              // This might not be needed for voice calls but useful for testing
               ws.send(JSON.stringify({
-                transcript,
+                type: 'interim_transcript',
+                transcript: transcript,
                 isInterim: true
               }));
             }
-            return;
+            return; // Don't process non-final results further here
           }
 
+          // Handle final transcript
           if (received.is_final) {
-            session.isSpeaking = false;
-            session.lastInterimTranscript = '';
-            session.interimResultsBuffer = [];
+            currentSession.isSpeaking = false;
+            currentSession.lastInterimTranscript = '';
+            currentSession.interimResultsBuffer = [];
 
-            if (session.silenceTimer) {
-              clearTimeout(session.silenceTimer);
-              session.silenceTimer = null;
+            if (currentSession.silenceTimer) {
+              clearTimeout(currentSession.silenceTimer);
+              currentSession.silenceTimer = null;
             }
 
-            if (transcript !== session.lastTranscript) {
-              session.transcriptBuffer.push(transcript);
-              session.lastTranscript = transcript;
+            if (transcript.trim().length > 0 && transcript !== currentSession.lastTranscript) {
+              currentSession.transcriptBuffer.push(transcript);
+              currentSession.lastTranscript = transcript;
             }
 
-            if (session.transcriptBuffer.length > 0) {
-              const finalTranscript = session.transcriptBuffer.join(' ');
-              session.userSpeak = true;
+            if (currentSession.transcriptBuffer.length > 0) {
+              const finalTranscript = currentSession.transcriptBuffer.join(' ').trim();
+              currentSession.userSpeak = true;
+              console.log(`Session ${currentSession.id}: Final Transcript: "${finalTranscript}"`);
+
+              // Send final transcript back to the Twilio stream
               ws.send(JSON.stringify({
+                type: 'final_transcript',
                 transcript: finalTranscript,
                 isFinal: true
               }));
 
               try {
-                console.log("Final transcript : ", finalTranscript)
                 const { processedText, outputType } = await aiProcessing.processInput(
                   { message: finalTranscript, input_channel: 'audio' },
-                  session
+                  currentSession
                 );
 
                 if (outputType === 'audio') {
-                  isAIResponding = true;
-                  const audioBuffer = await aiProcessing.synthesizeSpeech(processedText);
+                  currentSession.isAIResponding = true;
+                  const audioBuffer = await aiProcessing.synthesizeSpeech(processedText, currentSession.id);
                   if (!audioBuffer) {
-                    console.error('Failed to synthesize speech');
+                    console.error(`Session ${currentSession.id}: Failed to synthesize speech.`);
+                    currentSession.isAIResponding = false;
                     return;
                   }
-                  // console.log('Audio synthesized, converting to mulaw...');
-                  const mulawBuffer = await audioUtils.convertMp3ToMulaw(audioBuffer);
+                  const mulawBuffer = await audioUtils.convertMp3ToMulaw(audioBuffer, currentSession.id);
                   if (mulawBuffer) {
-                    // console.log('Starting audio response, buffer size:', mulawBuffer.length);
-                    // Send a marker before starting audio
-                    // ws.send(JSON.stringify({
-                    //   event: 'mark',
-                    //   streamSid: session.streamSid,
-                    //   mark: { name: 'start_audio' }
-                    // }));
-                    audioUtils.streamMulawAudioToTwilio(ws, session.streamSid, mulawBuffer, session);
-
-                    // console.log("Audio", mulawBuffer)
-                    // ws.send(JSON.stringify({
-                    //   event: 'media',
-                    //   streamSid: session.streamSid,
-                    //   media: { payload: mulawBuffer.toString('base64') }
-                    // }));
+                    audioUtils.streamMulawAudioToTwilio(ws, currentSession.streamSid, mulawBuffer, currentSession);
                   } else {
-                    console.error('Failed to convert audio to mulaw');
+                    console.error(`Session ${currentSession.id}: Failed to convert audio to mulaw.`);
+                    currentSession.isAIResponding = false;
                   }
                 } else {
+                  // Handle text output if your Twilio integration can display it
                   ws.send(JSON.stringify({
-                    type: 'text',
+                    type: 'ai_response_text',
                     text: processedText,
                     isFinal: true,
-                    latency: session.metrics
+                    latency: currentSession.metrics
                   }));
+                  currentSession.isAIResponding = false;
                 }
               } catch (err) {
-                console.error('Processing error:', err);
+                console.error(`Session ${currentSession.id}: AI Processing or TTS error:`, err);
                 ws.send(JSON.stringify({
-                  type: 'tts_error',
-                  error: 'Failed to process or synthesize speech'
+                  type: 'error',
+                  error: 'Failed to process AI response or synthesize speech.'
                 }));
+                currentSession.isAIResponding = false;
               }
-              session.transcriptBuffer = [];
+              currentSession.transcriptBuffer = []; // Clear buffer after processing
             }
           }
         }
       } catch (err) {
-        console.error('Deepgram parse error:', err);
+        console.error(`Session ${currentSession.id}: Deepgram message parse error:`, err);
       }
     });
 
-    session.dgSocket.on('error', (err) => {
-      console.error(`Deepgram error for session ${sessionId}:`, err);
-      handleReconnect();
+    currentSession.dgSocket.on('error', (err) => {
+      console.error(`Session ${currentSession.id}: Deepgram error:`, err);
+      // handleDeepgramReconnect(currentSession);
     });
 
-    session.dgSocket.on('close', () => {
-      console.log(`Deepgram closed for session ${sessionId}`);
-      handleReconnect();
+    currentSession.dgSocket.on('close', () => {
+      console.log(`Session ${currentSession.id}: Deepgram connection closed.`);
+      // handleDeepgramReconnect(currentSession);
     });
   };
 
-  const handleReconnect = () => {
-    if (session.reconnectAttempts < CONFIG.MAX_RECONNECT_ATTEMPTS) {
-      session.reconnectAttempts++;
-      console.log(`Reconnecting to Deepgram (${session.reconnectAttempts}/${CONFIG.MAX_RECONNECT_ATTEMPTS})...`);
-      setTimeout(connectToDeepgram, CONFIG.RECONNECT_DELAY);
-    } else {
-      console.error('Max reconnection attempts reached');
-      ws.send(JSON.stringify({ error: 'Failed to connect to transcription service' }));
-    }
-  };
+  // Function to handle Deepgram reconnection for a specific session
+  // const handleDeepgramReconnect = (currentSession) => {
+  //   if (!currentSession || !currentSession.id) return; // Defensive check
 
-  const handleInterruption = async (session) => {
-    if (!session || !session.isAIResponding) return;
+  //   if (currentSession.reconnectAttempts < CONFIG.MAX_RECONNECT_ATTEMPTS) {
+  //     currentSession.reconnectAttempts++;
+  //     console.log(`Session ${currentSession.id}: Reconnecting to Deepgram (${currentSession.reconnectAttempts}/${CONFIG.MAX_RECONNECT_ATTEMPTS})...`);
+  //     setTimeout(() => connectToDeepgram(currentSession), CONFIG.RECONNECT_DELAY);
+  //   } else {
+  //     console.error(`Session ${currentSession.id}: Max Deepgram reconnection attempts reached. Terminating session.`);
+  //     ws.send(JSON.stringify({ error: 'Failed to connect to transcription service. Ending call.' }));
+  //     ws.close(); // Close the Twilio WebSocket, prompting Twilio to hang up
+  //   }
+  // };
 
-    console.log('Handling interruption...');
+  // Function to handle interruption of AI speech
+  const handleInterruption = (currentSession) => {
+    if (!currentSession || !currentSession.isAIResponding) return;
 
-    // Immediately stop any ongoing audio
-    if (session.currentAudioStream) {
+    console.log(`Session ${currentSession.id}: Handling interruption.`);
+
+    // Stop any ongoing audio stream for this session
+    if (currentSession.currentAudioStream && typeof currentSession.currentAudioStream.stop === 'function') {
       try {
-        session.currentAudioStream.stop();
+        currentSession.currentAudioStream.stop();
       } catch (error) {
-        console.error('Error stopping audio stream:', error);
+        console.error(`Session ${currentSession.id}: Error stopping current audio stream:`, error);
       }
-      session.currentAudioStream = null;
+      currentSession.currentAudioStream = null;
     }
 
-    // Force stop the audio stream by sending multiple silence buffers
-    for (let i = 0; i < 5; i++) {
-      const silenceBuffer = audioUtils.generateSilenceBuffer(20);
+    // Send a few small silence buffers to Twilio to quickly "cut off" any remaining audio
+    // This is a common trick to ensure prompt interruption.
+    for (let i = 0; i < 3; i++) {
+      const silenceBuffer = audioUtils.generateSilenceBuffer(10); // 10ms silence
       try {
         ws.send(JSON.stringify({
           event: 'media',
-          streamSid: session.streamSid,
+          streamSid: currentSession.streamSid,
           media: { payload: silenceBuffer.toString('base64') }
         }));
       } catch (error) {
-        console.error('Error sending silence buffer:', error);
+        console.error(`Session ${currentSession.id}: Error sending silence buffer during interruption:`, error);
       }
     }
 
-    // Immediately set states
-    session.isAIResponding = false;
-    session.interruption = true;
+    currentSession.isAIResponding = false;
+    currentSession.interruption = true; // Set flag to prevent new audio from starting immediately
 
-    // Reset interruption state after a very short delay
+    // Reset interruption flag after a short cooldown
     setTimeout(() => {
-      session.interruption = false;
-    }, 200);
+      currentSession.interruption = false;
+      console.log(`Session ${currentSession.id}: Interruption cooldown finished.`);
+    }, currentSession.interruptionCooldown);
   };
 
-  connectToDeepgram();
-
-  setInterval(() => {
-    if (!isSpeechActive && session?.dgSocket?.readyState === WebSocket.OPEN) {
-      session.dgSocket.send(JSON.stringify({ type: "KeepAlive" }));
-    }
-  }, 10000);
-
-  vad.stdout.on('data', (data) => {
-    try {
-      const parsed = JSON.parse(data.toString());
-
-      // Handle VAD events
-      if (parsed.event === 'speech_start') {
-        isSpeechActive = true;
-        console.log('Speech started');
-        // Immediately interrupt if AI is responding
-        if (session?.isAIResponding) {
-          console.log('Interruption detected from VAD - stopping current response');
-          handleInterruption(session);
-        }
-      } else if (parsed.event === 'speech_end') {
-        isSpeechActive = false;
-        console.log('Speech ended');
-        if (session?.interruption) {
-          session.interruption = false;
-        }
-        if (isSpeechActive === false && session?.dgSocket?.readyState === WebSocket.OPEN) {
-          session.dgSocket.send(JSON.stringify({
-            "type": "Finalize"
-          }));
-        }
-      }
-
-      // Process audio chunks
-      if (parsed.chunk) {
-        const audioBuffer = Buffer.from(parsed.chunk, 'hex');
-        deepgramBuffer = Buffer.concat([deepgramBuffer, audioBuffer]);
-
-        if (deepgramBuffer.length >= CONFIG.CHUNK_SIZE && session?.dgSocket?.readyState === WebSocket.OPEN) {
-          session.audioStartTime = Date.now();
-          session.dgSocket.send(deepgramBuffer);
-          deepgramBuffer = Buffer.alloc(0);
-        }
-      }
-    } catch (err) {
-      console.error('VAD parse error:', err);
-    }
-  });
-
+  // Main message handler for the Twilio WebSocket connection
   ws.on('message', async (data) => {
     try {
       const parsedData = JSON.parse(data);
 
-      if (parsedData.type === 'chat') {
-        if (!sessionId) {
-          console.error('No session ID available for chat message');
+      if (parsedData.event === 'start') {
+        sessionId = parsedData.streamSid;
+        session = sessionManager.createSession(sessionId, ws); // Pass ws to session manager
+        session.callSid = parsedData.start.callSid;
+        session.streamSid = parsedData.streamSid; // Confirm streamSid in session
+
+        console.log(`Session ${sessionId}: Twilio stream started for CallSid: ${session.callSid}`);
+
+        // Initialize per-session FFmpeg and VAD processes
+        session.ffmpegProcess = spawn('ffmpeg', [
+          '-loglevel', 'quiet',
+          '-f', 'mulaw', // Input format from Twilio
+          '-ar', CONFIG.AUDIO_SAMPLE_RATE.toString(), // Input sample rate from Twilio
+          '-ac', '1', // Input channels
+          '-i', 'pipe:0', // Input from stdin
+          '-f', 's16le', // Output format for VAD/Deepgram
+          '-acodec', 'pcm_s16le', // Output codec
+          '-ar', CONFIG.SAMPLE_RATE.toString(), // Output sample rate for VAD/Deepgram
+          '-ac', '1', // Output channels
+          'pipe:1' // Output to stdout
+        ]);
+
+        session.vadProcess = spawn(pythonPath, ['vad.py']); // Use env var for Python path
+        session.ffmpegProcess.stdout.pipe(session.vadProcess.stdin); // Pipe FFmpeg output to VAD input
+
+        // Attach VAD listener specific to this session
+        session.vadProcess.stdout.on('data', (vadData) => {
+          try {
+            const parsedVAD = JSON.parse(vadData.toString());
+
+            if (parsedVAD.event === 'speech_start') {
+              session.isVadSpeechActive = true;
+              console.log(`Session ${session.id}: VAD detected Speech START.`);
+              if (session.isAIResponding && (Date.now() - session.lastInterruptionTime > session.interruptionCooldown)) {
+                console.log(`Session ${session.id}: VAD detected speech during AI response. Initiating interruption.`);
+                handleInterruption(session);
+                session.lastInterruptionTime = Date.now(); // Update last interruption time
+              }
+            } else if (parsedVAD.event === 'speech_end') {
+              session.isVadSpeechActive = false;
+              console.log(`Session ${session.id}: VAD detected Speech END.`);
+              // No need to reset interruption flag here, handleInterruption manages it
+            }
+
+            if (parsedVAD.chunk) {
+              const audioBuffer = Buffer.from(parsedVAD.chunk, 'hex');
+              session.vadDeepgramBuffer = Buffer.concat([session.vadDeepgramBuffer, audioBuffer]);
+
+              if (session.vadDeepgramBuffer.length >= CONFIG.CHUNK_SIZE && session.dgSocket?.readyState === WebSocket.OPEN) {
+                session.audioStartTime = Date.now(); // Mark time when audio is sent to Deepgram
+                session.dgSocket.send(session.vadDeepgramBuffer);
+                session.vadDeepgramBuffer = Buffer.alloc(0); // Reset buffer
+              }
+            }
+          } catch (err) {
+            console.error(`Session ${session.id}: VAD output parse error:`, err);
+          }
+        });
+
+        // Handle errors from FFmpeg and VAD processes for this session
+        session.ffmpegProcess.stderr.on('data', (data) => {
+          // console.error(`Session ${sessionId}: FFmpeg stderr: ${data.toString()}`);
+        });
+        session.ffmpegProcess.on('error', (err) => {
+          console.error(`Session ${sessionId}: FFmpeg process error:`, err);
+        });
+        session.ffmpegProcess.on('close', (code) => {
+          if (code !== 0) console.warn(`Session ${sessionId}: FFmpeg process exited with code ${code}.`);
+        });
+
+        session.vadProcess.stderr.on('data', (data) => {
+          // console.error(`Session ${sessionId}: VAD stderr: ${data.toString()}`);
+        });
+        session.vadProcess.on('error', (err) => {
+          console.error(`Session ${sessionId}: VAD process error:`, err);
+        });
+        session.vadProcess.on('close', (code) => {
+          if (code !== 0) console.warn(`Session ${sessionId}: VAD process exited with code ${code}.`);
+        });
+
+        // Connect to Deepgram after processes are set up
+        connectToDeepgram(session);
+
+        // Send initial announcement
+        const announcementText = session.chatHistory[0].A; // Get initial message from chat history
+        const mp3Buffer = await aiProcessing.synthesizeSpeech(announcementText, session.id);
+        if (mp3Buffer) {
+          const mulawBuffer = await audioUtils.convertMp3ToMulaw(mp3Buffer, session.id);
+          if (mulawBuffer) {
+            audioUtils.streamMulawAudioToTwilio(ws, session.streamSid, mulawBuffer, session);
+          }
+        }
+
+      } else if (parsedData.event === 'media' && parsedData.media?.payload) {
+        // Ensure session exists and ffmpeg is ready to receive audio
+        if (session && session.ffmpegProcess && session.ffmpegProcess.stdin.writable) {
+          const audioBuffer = Buffer.from(parsedData.media.payload, 'base64');
+          session.ffmpegProcess.stdin.write(audioBuffer); // Write to this session's ffmpeg
+        } else {
+          // console.warn(`Session ${sessionId}: Media received but ffmpeg not ready or session not found.`);
+        }
+      } else if (parsedData.type === 'chat') {
+        // This block handles chat messages (if your client sends them over the same WS)
+        if (!session) {
+          console.error('No session ID available for chat message. Ignoring.');
           return;
         }
         const { processedText, outputType } = await aiProcessing.processInput(parsedData.message, session);
 
         if (outputType === 'text') {
           ws.send(JSON.stringify({
-            type: 'text',
+            type: 'text_response',
             text: processedText,
             isFinal: true,
             latency: session.metrics
           }));
         } else if (outputType === 'audio') {
-          const audioBuffer = await aiProcessing.synthesizeSpeech(processedText);
+          const audioBuffer = await aiProcessing.synthesizeSpeech(processedText, session.id);
           if (audioBuffer) {
-            ws.send(JSON.stringify({
-              type: 'audio',
-              audio: audioBuffer.toString('base64'),
-              isFinal: true,
-              latency: session.metrics
-            }));
+            const mulawBuffer = await audioUtils.convertMp3ToMulaw(audioBuffer, session.id);
+            if (mulawBuffer) {
+              audioUtils.streamMulawAudioToTwilio(ws, session.streamSid, mulawBuffer, session);
+            }
           }
         }
       }
-
-      if (parsedData.event === 'media' && parsedData.media?.payload) {
-        const audioBuffer = Buffer.from(parsedData.media.payload, 'base64');
-        if (ffmpeg.stdin.writable) {
-          ffmpeg.stdin.write(audioBuffer);
-        }
-      }
-
-      if (parsedData.event === 'start') {
-        sessionId = parsedData.streamSid;
-        session = sessionManager.createSession(sessionId);
-        session.callSid = parsedData.start.callSid;
-        session.streamSid = parsedData.streamSid;
-
-        // Connect to Deepgram after we have the session ID
-        connectToDeepgram();
-
-        const announcementText = "Hello! You are speaking to an AI assistant.";
-        const mp3Buffer = await aiProcessing.synthesizeSpeech(announcementText);
-        const mulawBuffer = await audioUtils.convertMp3ToMulaw(mp3Buffer);
-        if (mulawBuffer) {
-          audioUtils.streamMulawAudioToTwilio(ws, session.streamSid, mulawBuffer, session);
-        }
-      }
+      // Add other event types if necessary (e.g., 'stop', 'mark')
     } catch (err) {
-      console.error('Message processing error:', err);
+      console.error(`Session ${sessionId}: Error processing Twilio WebSocket message:`, err);
     }
   });
 
   ws.on('close', () => {
+    console.log(`Session ${sessionId}: Twilio client disconnected.`);
     if (sessionId) {
-      console.log(`Client disconnected for session ${sessionId}`);
       sessionManager.deleteSession(sessionId);
     }
+    clearInterval(deepgramKeepAliveInterval); // Clear keep-alive for this WS
   });
 
   ws.on('error', (error) => {
+    console.error(`Session ${sessionId}: Twilio client error:`, error);
     if (sessionId) {
-      console.error(`Client error for session ${sessionId}:`, error);
-      sessionManager.cleanupSession(sessionId);
+      sessionManager.cleanupSession(sessionId); // Cleanup on error
     }
+    clearInterval(deepgramKeepAliveInterval); // Clear keep-alive for this WS
   });
 });
 
-// Process Termination Handler
+// Process Termination Handler for the main server process
 process.on('SIGINT', () => {
-  if (ffmpeg.stdin.writable) ffmpeg.stdin.end();
-  process.exit();
+  console.log('\nServer shutting down. Cleaning up all sessions...');
+  sessionManager.sessions.forEach((s, sessionId) => {
+    sessionManager.cleanupSession(sessionId);
+  });
+  // Give a small moment for processes to terminate
+  setTimeout(() => {
+    wss.close(() => {
+      console.log('WebSocket server closed.');
+      process.exit(0);
+    });
+  }, 500);
 });
