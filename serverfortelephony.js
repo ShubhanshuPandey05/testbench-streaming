@@ -36,7 +36,7 @@ const services = {
             secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
         },
     }),
-    openai: new OpenAI({ apiKey: process.env.OPEN_AI_API_KEY })
+    openai: new OpenAI({ apiKey: process.env.OPEN_AI })
 };
 
 // Performance Monitoring (Global, as it aggregates stats from all sessions)
