@@ -4,7 +4,7 @@ const client = new twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUT
 client.calls.create({
   url: 'https://temp-vb4k.onrender.com/voice', // Endpoint that returns TwiML instructions
   to: process.env.to, // Recipient's phone number
-  from: process.env.from// Your Twilio number
+  from: "+16812215320"// Your Twilio number
 })
 .then(call => console.log(call.sid));
 // app.post('/voice', (req, res) => {

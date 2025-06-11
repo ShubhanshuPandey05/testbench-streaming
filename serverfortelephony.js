@@ -6,6 +6,350 @@ const { PollyClient, SynthesizeSpeechCommand } = require("@aws-sdk/client-polly"
 const OpenAI = require("openai");
 const twilio = require('twilio'); // This might not be directly used in the WebSocket server, but kept for consistency
 const fs = require('fs'); // Not used in this version, but kept for consistency
+const url = require('url');
+
+
+const SHOPIFY_STORE_URL = process.env.SHOPIFY_STORE_URL;
+const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const graphqlEndpoint = `https://${SHOPIFY_STORE_URL}/admin/api/2023-01/graphql.json`;
+
+const toolDefinitions = [
+    {
+        type: "function",
+        name: "getAllProducts",
+        description: "Get a list of all products in the store.",
+        parameters: {
+            type: "object",
+            properties: {},
+            required: []
+        }
+    },
+    {
+        type: "function",
+        name: "getUserDetailsByPhoneNo",
+        description: "Get customer details by phone number.",
+        parameters: {
+            type: "object",
+            properties: {
+                phone: { type: "string", description: "The customer's phone number." }
+            },
+            required: ["phone"]
+        }
+    },
+    {
+        type: "function",
+        name: "getAllOrders",
+        description: "Get a list of all orders.",
+        parameters: {
+            type: "object",
+            properties: {},
+            required: []
+        }
+    },
+    {
+        type: "function",
+        name: "getOrderById",
+        description: "Get details for a specific order by its ID.",
+        parameters: {
+            type: "object",
+            properties: {
+                orderId: { type: "string", description: "The Shopify order ID." }
+            },
+            required: ["orderId"]
+        }
+    }
+];
+
+
+// let ASSISTANT_ID;
+
+// Service Initialization
+const services = {
+    twilio: new twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN),
+    polly: new PollyClient({
+        region: "us-east-1",
+        credentials: {
+            accessKeyId: process.env.accessKeyId,
+            secretAccessKey: process.env.secretAccessKey,
+        },
+    }),
+    openai: new OpenAI({ apiKey: process.env.OPEN_AI })
+};
+
+// async function createAssistance(params) {
+//     const assistant = await services.openai.beta.assistants.create({
+//         model: "gpt-4o-mini",
+//         name: "Shopify Assistant",
+//         instructions: `You are a helpful AI assistant for the Shopify store "Gautam Garment". You have access to several tools (functions) that let you fetch and provide real-time information about products, orders, and customers from the store.
+
+// Your Tasks:
+
+// Understand the user's message and intent.
+// If you need specific store data (like product lists, order details, or customer info), use the available tools by calling the appropriate function with the required parameters.
+// After receiving tool results, use them to generate a helpful, concise, and accurate response for the user.
+// Always return your answer in JSON format with two fields:
+// "response": your textual reply for the user
+// "output_channel": the medium for your response (currently, only "audio" is available)
+
+// Example Output:
+// {
+// "response": "Here are the top 5 products from Gautam Garment.",
+// "output_channel": "audio"
+// }
+
+// User Input Format:
+// The user's message will be a JSON object with "message" and "input_channel", for example:
+// {
+// "message": "Show me my recent orders",
+// "input_channel": "audio"
+// }
+
+// Available Tools (functions):
+// getAllProducts: Get a list of all products in the store.
+// getUserDetailsByPhoneNo: Get customer details by phone number.
+// getAllOrders: Get a list of all orders.
+// getOrderById: Get details for a specific order by its ID.
+
+// Instructions:
+// If a user's request requires store data, call the relevant tool first, then use its result in your reply.
+// If the user asks a general question or your response does not require real-time store data, answer directly.
+// Always use the user's input_channel for your response if it matches the available output channels (currently, only "audio").
+// The store name is "Gautam Garment"—refer to it by name in your responses when appropriate.`,
+//         tools: toolDefinitions
+//     });
+//     ASSISTANT_ID = assistant.id
+//     console.log("✅ Assistant connected with assitant id : ", ASSISTANT_ID)
+// }
+
+// createAssistance();
+
+const functions = {
+    async getAllProducts(cursor = null) {
+        const query = `
+    {
+      products(first: 50${cursor ? `, after: "${cursor}"` : ''}) {
+        edges {
+          cursor
+          node {
+            id
+            title
+            handle
+            description
+            variants(first: 10) {
+              edges {
+                node {
+                  id
+                  title
+                }
+              }
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+        }
+      }
+    }
+  `;
+
+        const response = await fetch(graphqlEndpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+            },
+            body: JSON.stringify({ query }),
+        });
+
+        const data = await response.json();
+        if (!data.data || !data.data.products) return { products: [], hasNextPage: false, lastCursor: null };
+
+        const products = data.data.products.edges.map(edge => ({
+            id: edge.node.id,
+            title: edge.node.title,
+            handle: edge.node.handle,
+            description: edge.node.description,
+            variants: edge.node.variants.edges.map(variantEdge => ({
+                id: variantEdge.node.id,
+                title: variantEdge.node.title
+            }))
+        }));
+
+        const hasNextPage = data.data.products.pageInfo.hasNextPage;
+        const lastCursor = data.data.products.edges.length > 0 ? data.data.products.edges[data.data.products.edges.length - 1].cursor : null;
+
+        // console.log(products)
+
+        return products;
+    },
+
+    async getUserDetailsByPhoneNo(phone) {
+        const query = `
+    {
+      customers(first: 1, query: "phone:${phone}") {
+        edges {
+          node {
+            id
+            firstName
+            lastName
+            email
+            phone
+            ordersCount
+          }
+        }
+      }
+    }
+  `;
+
+        const response = await fetch(graphqlEndpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+            },
+            body: JSON.stringify({ query }),
+        });
+
+        const data = await response.json();
+        if (!data.data || !data.data.customers.edges.length) return null;
+
+        const user = data.data.customers.edges[0].node;
+        return {
+            id: user.id,
+            firstName: user.firstName,
+            lastName: user.lastName,
+            email: user.email,
+            phone: user.phone,
+            ordersCount: user.ordersCount
+        };
+    },
+
+    async getAllOrders(cursor = null) {
+        const query = `
+    {
+      orders(first: 50${cursor ? `, after: "${cursor}"` : ''}) {
+        edges {
+          cursor
+          node {
+            id
+            name
+            email
+            phone
+            totalPriceSet {
+              shopMoney {
+                amount
+                currencyCode
+              }
+            }
+            createdAt
+            fulfillmentStatus
+            lineItems(first: 10) {
+              edges {
+                node {
+                  title
+                  quantity
+                }
+              }
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+        }
+      }
+    }
+  `;
+
+        const response = await fetch(graphqlEndpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+            },
+            body: JSON.stringify({ query }),
+        });
+
+        const data = await response.json();
+        if (!data.data || !data.data.orders) return { orders: [], hasNextPage: false, lastCursor: null };
+
+        const orders = data.data.orders.edges.map(edge => ({
+            id: edge.node.id,
+            name: edge.node.name,
+            email: edge.node.email,
+            phone: edge.node.phone,
+            total: edge.node.totalPriceSet.shopMoney.amount,
+            currency: edge.node.totalPriceSet.shopMoney.currencyCode,
+            createdAt: edge.node.createdAt,
+            fulfillmentStatus: edge.node.fulfillmentStatus,
+            lineItems: edge.node.lineItems.edges.map(itemEdge => ({
+                title: itemEdge.node.title,
+                quantity: itemEdge.node.quantity
+            }))
+        }));
+
+        const hasNextPage = data.data.orders.pageInfo.hasNextPage;
+        const lastCursor = data.data.orders.edges.length > 0 ? data.data.orders.edges[data.data.orders.edges.length - 1].cursor : null;
+
+        return { orders, hasNextPage, lastCursor };
+    },
+
+    async getOrderById(orderId) {
+        const query = `
+    {
+      order(id: "${orderId}") {
+        id
+        name
+        email
+        phone
+        totalPriceSet {
+          shopMoney {
+            amount
+            currencyCode
+          }
+        }
+        createdAt
+        fulfillmentStatus
+        lineItems(first: 10) {
+          edges {
+            node {
+              title
+              quantity
+            }
+          }
+        }
+      }
+    }
+  `;
+
+        const response = await fetch(graphqlEndpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+            },
+            body: JSON.stringify({ query }),
+        });
+
+        const data = await response.json();
+        if (!data.data || !data.data.order) return null;
+
+        const order = data.data.order;
+        return {
+            id: order.id,
+            name: order.name,
+            email: order.email,
+            phone: order.phone,
+            total: order.totalPriceSet.shopMoney.amount,
+            currency: order.totalPriceSet.shopMoney.currencyCode,
+            createdAt: order.createdAt,
+            fulfillmentStatus: order.fulfillmentStatus,
+            lineItems: order.lineItems.edges.map(itemEdge => ({
+                title: itemEdge.node.title,
+                quantity: itemEdge.node.quantity
+            }))
+        };
+    }
+}
 
 // Configuration Constants
 const CONFIG = {
@@ -24,19 +368,6 @@ const CONFIG = {
     GPT_MODEL: "gpt-4o-mini",
     GPT_MAX_TOKENS: 150,
     GPT_TEMPERATURE: 0.1
-};
-
-// Service Initialization
-const services = {
-    twilio: new twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN),
-    polly: new PollyClient({
-        region: "us-east-1",
-        credentials: {
-            accessKeyId: process.env.accessKeyId,
-            secretAccessKey: process.env.secretAccessKey,
-        },
-    }),
-    openai: new OpenAI({ apiKey: process.env.OPEN_AI })
 };
 
 // Performance Monitoring (Global, as it aggregates stats from all sessions)
@@ -94,6 +425,7 @@ class SessionManager {
             transcriptBuffer: [],
             // silenceTimer: null, // Not used with current VAD/Deepgram approach
             audioStartTime: null, // For latency measurement
+            userPhoneno: null,
             lastInterimTime: Date.now(),
             isSpeaking: false, // User speaking status from Deepgram's perspective
             lastInterimTranscript: '',
@@ -106,32 +438,71 @@ class SessionManager {
             interruption: false, // Flag for user interruption during AI speech
             lastInterruptionTime: 0,
             interruptionCooldown: 200,
+            ASSISTANT_ID: null,
+            lastResponseId: null,
+            threadId: null,
+            phoneNo: '',
             currentMessage: {},
             chatHistory: [{
                 A: "Hello! You are speaking to an AI assistant."
             }],
             // AI prompt, specific to each session
-            prompt: `
-You are a helpful assistant. Generate your response in JSON format containing two major parts: 1) "response" (your textual reply) and 2) "output_channel" (the medium for the response). For example:
+            //             prompt: `
+            // You are a helpful assistant. Generate your response in JSON format containing two major parts: 1) "response" (your textual reply) and 2) "output_channel" (the medium for the response). For example:
+            // {
+            //   "response": "Your response for the user message",
+            //   "output_channel": "audio"
+            // }
+
+            // The "output_channel" must be one of the available channels. Currently, only "audio" is available. Always prioritize the input channel if suitable for the response.
+
+            // The user's message will be a JSON object with "message" and "input_channel". For example:
+            // {
+            //   "message": "User's message",
+            //   "input_channel": "audio"
+            // }
+
+            // I will provide you with the chat history and the current user message. The chat history will be structured like this:
+            // [
+            //   { "A": "Assistant Message" },
+            //   { "U": "User Message" }
+            // ]
+            // `,
+            prompt: `You are a helpful AI assistant for the Shopify store "Gautam Garment". You have access to several tools (functions) that let you fetch and provide real-time information about products, orders, and customers from the store.
+
+Your Tasks:
+
+Understand the user's message and intent.
+If you need specific store data (like product lists, order details, or customer info), use the available tools by calling the appropriate function with the required parameters.
+After receiving tool results, use them to generate a helpful, concise, and accurate response for the user.
+Always return your answer in JSON format with two fields:
+"response": your textual reply for the user
+"output_channel": the medium for your response (currently, only "audio" is available)
+
+Example Output:
 {
-  "response": "Your response for the user message",
-  "output_channel": "audio"
+"response": "Here are the top 5 products from Gautam Garment.",
+"output_channel": "audio"
 }
 
-The "output_channel" must be one of the available channels. Currently, only "audio" is available. Always prioritize the input channel if suitable for the response.
-
-The user's message will be a JSON object with "message" and "input_channel". For example:
+User Input Format:
+The user's message will be a JSON object with "message" and "input_channel", for example:
 {
-  "message": "User's message",
-  "input_channel": "audio"
+"message": "Show me my recent orders",
+"input_channel": "audio"
 }
 
-I will provide you with the chat history and the current user message. The chat history will be structured like this:
-[
-  { "A": "Assistant Message" },
-  { "U": "User Message" }
-]
-`,
+Available Tools (functions):
+getAllProducts: Get a list of all products in the store.
+getUserDetailsByPhoneNo: Get customer details by phone number.
+getAllOrders: Get a list of all orders.
+getOrderById: Get details for a specific order by its ID.
+
+Instructions:
+If a user's request requires store data, call the relevant tool first, then use its result in your reply.
+If the user asks a general question or your response does not require real-time store data, answer directly.
+Always use the user's input_channel for your response if it matches the available output channels (currently, only "audio").
+The store name is "Gautam Garment"—refer to it by name in your responses when appropriate.`,
             metrics: { llm: 0, stt: 0, tts: 0 },
 
             // Per-session child processes for audio handling
@@ -240,7 +611,7 @@ const audioUtils = {
     },
 
     streamMulawAudioToTwilio: function (ws, streamSid, mulawBuffer, session) {
-        const CHUNK_SIZE_MULAW = 160; // 20ms of 8khz mulaw (8000 samples/sec * 0.020 sec = 160 samples, 1 byte/sample)
+        const CHUNK_SIZE_MULAW = 1600; // 20ms of 8khz mulaw (8000 samples/sec * 0.020 sec = 160 samples, 1 byte/sample)
         let offset = 0;
         session.isAIResponding = true;
         session.interruption = false; // Reset interruption flag when AI starts speaking
@@ -279,7 +650,7 @@ const audioUtils = {
                 }));
                 offset += CHUNK_SIZE_MULAW;
                 // Schedule next chunk slightly faster than chunk duration for continuous flow
-                setTimeout(sendChunk, 180); // 180ms delay for 200ms chunk
+                setTimeout(sendChunk, 200); // 180ms delay for 200ms chunk
             } catch (error) {
                 console.error(`Session ${session.id}: Error sending audio chunk:`, error);
                 stopFunction(); // Stop on error
@@ -291,52 +662,131 @@ const audioUtils = {
 
 // AI Processing
 const aiProcessing = {
+    // async processInput(input, session) {
+    //     try {
+    //         session.currentMessage = input;
+    //         session.chatHistory.push({ U: input.message });
+
+    //         // Prepare messages for OpenAI
+    //         const messages = [
+    //             { role: "system", content: session.prompt },
+    //             { role: "user", content: JSON.stringify({ chatHistory: session.chatHistory, currentMessage: session.currentMessage }) }
+    //         ];
+
+    //         const startTime = Date.now();
+    //         const response = await services.openai.chat.completions.create({
+    //             model: CONFIG.GPT_MODEL,
+    //             messages: messages,
+    //             temperature: CONFIG.GPT_TEMPERATURE,
+    //             max_tokens: CONFIG.GPT_MAX_TOKENS,
+    //             response_format: { type: "json_object" } // Request JSON object directly
+    //         });
+    //         const latency = Date.now() - startTime;
+    //         session.metrics.llm = latency;
+
+    //         let parsedData;
+    //         try {
+    //             parsedData = JSON.parse(response.choices[0].message.content);
+    //             console.log(`Session ${session.id}: LLM Raw Response:`, response.choices[0].message.content);
+    //             console.log(`Session ${session.id}: Parsed LLM response:`, parsedData.response);
+    //             console.log(`Session ${session.id}: Parsed LLM output channel:`, parsedData.output_channel);
+    //             session.chatHistory.push({ A: parsedData.response });
+    //             return { processedText: parsedData.response, outputType: parsedData.output_channel };
+    //         } catch (error) {
+    //             console.error(`Session ${session.id}: Error parsing LLM JSON response:`, error);
+    //             console.log(`Session ${session.id}: Attempting to use raw LLM content:`, response.choices[0].message.content);
+    //             session.chatHistory.push({ A: response.choices[0].message.content });
+    //             // Fallback if JSON parsing fails
+    //             return {
+    //                 processedText: response.choices[0].message.content || "Sorry, I had trouble understanding. Could you please rephrase?",
+    //                 outputType: 'audio' // Default to audio if parsing fails
+    //             };
+    //         }
+    //     } catch (error) {
+    //         console.error(`Session ${session.id}: Error processing input with OpenAI:`, error);
+    //         // Fallback for API errors
+    //         return { processedText: "I'm having trouble connecting right now. Please try again later.", outputType: 'audio' };
+    //     }
+    // },
+
     async processInput(input, session) {
-        try {
-            session.currentMessage = input;
-            session.chatHistory.push({ U: input.message });
+        // On the first user message, previous_response_id will be undefined.
+        // On subsequent turns, set previous_response_id to maintain context.
 
-            // Prepare messages for OpenAI
-            const messages = [
-                { role: "system", content: session.prompt },
-                { role: "user", content: JSON.stringify({ chatHistory: session.chatHistory, currentMessage: session.currentMessage }) }
-            ];
 
-            const startTime = Date.now();
-            const response = await services.openai.chat.completions.create({
-                model: CONFIG.GPT_MODEL,
-                messages: messages,
-                temperature: CONFIG.GPT_TEMPERATURE,
-                max_tokens: CONFIG.GPT_MAX_TOKENS,
-                response_format: { type: "json_object" } // Request JSON object directly
-            });
-            const latency = Date.now() - startTime;
-            session.metrics.llm = latency;
+        const createResponseParams = {
+            model: "gpt-4o-mini", // required
+            input: input.message, // required
+            instructions: session.prompt,
+            tools: toolDefinitions
+        };
+        if (session.lastResponseId) {
+            createResponseParams.previous_response_id = session.lastResponseId;
+        }
 
-            let parsedData;
-            try {
-                parsedData = JSON.parse(response.choices[0].message.content);
-                console.log(`Session ${session.id}: LLM Raw Response:`, response.choices[0].message.content);
-                console.log(`Session ${session.id}: Parsed LLM response:`, parsedData.response);
-                console.log(`Session ${session.id}: Parsed LLM output channel:`, parsedData.output_channel);
-                session.chatHistory.push({ A: parsedData.response });
-                return { processedText: parsedData.response, outputType: parsedData.output_channel };
-            } catch (error) {
-                console.error(`Session ${session.id}: Error parsing LLM JSON response:`, error);
-                console.log(`Session ${session.id}: Attempting to use raw LLM content:`, response.choices[0].message.content);
-                session.chatHistory.push({ A: response.choices[0].message.content });
-                // Fallback if JSON parsing fails
-                return {
-                    processedText: response.choices[0].message.content || "Sorry, I had trouble understanding. Could you please rephrase?",
-                    outputType: 'audio' // Default to audio if parsing fails
-                };
+        // Send the user's message to OpenAI
+        let response = await services.openai.responses.create(createResponseParams);
+
+        // Save the latest response ID for continuity
+        session.lastResponseId = response.id;
+        console.log(response)
+
+        if (response.output[0].type === "function_call") {
+            const tool = []
+            let toolResult;
+
+            if (response.output[0].name === "getAllProducts") {
+                toolResult = await functions.getAllProducts();
+            } else if (response.output[0].name === "getUserDetailsByPhoneNo") {
+                toolResult = await functions.getUserDetailsByPhoneNo(args.phone);
+            } else if (response.output[0].name === "getAllOrders") {
+                toolResult = await functions.getAllOrders();
+            } else if (response.output[0].name === "getOrderById") {
+                toolResult = await functions.getOrderById(args.orderId);
+            } else {
+                toolResult = { error: "Unknown tool requested." };
             }
+            // console.log(toolResult)
+            console.log(response.output)
+
+            tool.push({
+                type: "function_call_output",
+                call_id: response.output[0].call_id,
+                output: JSON.stringify({ toolResult })
+            });
+            // console.log(message)
+            response = await services.openai.responses.create({
+                model: "gpt-4o-mini",
+                instructions: session.prompt,
+                input: tool,
+                previous_response_id: session.lastResponseId // chain for context
+            });
+        }
+
+
+
+
+        // Extract the assistant's latest 
+
+
+        session.lastResponseId = response.id;
+
+        const messages = response.output || [];
+        const assistantMessage = messages.find(m => m.role === "assistant");
+
+        let parsedData;
+        try {
+            parsedData = JSON.parse(assistantMessage.content[0].text);
+            return { processedText: parsedData.response, outputType: parsedData.output_channel };
         } catch (error) {
-            console.error(`Session ${session.id}: Error processing input with OpenAI:`, error);
-            // Fallback for API errors
-            return { processedText: "I'm having trouble connecting right now. Please try again later.", outputType: 'audio' };
+            return {
+                processedText: assistantMessage.content[0].text || "Sorry, I had trouble understanding. Could you please rephrase?",
+                outputType: 'audio'
+            };
         }
     },
+
+
 
     async synthesizeSpeech(text, sessionId) {
         if (!text) {
@@ -374,7 +824,11 @@ console.log("✅ WebSocket server started on ws://localhost:5001");
 const sessionManager = new SessionManager();
 
 // WebSocket Connection Handler
-wss.on('connection', (ws) => {
+wss.on('connection', (ws,req) => {
+    // const params = new URLSearchParams(url.parse(req.url).query);
+    // const callerNumber = params.get('caller');
+    // console.log('WS Connection URL:', req.url);
+    // console.log('Tera number', callerNumber);
     console.log("🎧 New Twilio client connected.");
     let sessionId = null; // Will be set once 'start' event is received
     let session = null; // Reference to the session object
@@ -400,12 +854,8 @@ wss.on('connection', (ws) => {
         }
 
         currentSession.dgSocket = new WebSocket(
-            `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=${CONFIG.SAMPLE_RATE}&channels=1&model=nova-3&language=en&punctuate=true&interim_results=true&endpointing=100`,
-            {
-                headers: {
-                    'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`
-                }
-            }
+            `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-3&language=en&punctuate=true&interim_results=true&endpointing=50`,
+            ['token', `${process.env.DEEPGRAM_API}`]
         );
 
         currentSession.dgSocket.on('open', () => {
@@ -520,12 +970,12 @@ wss.on('connection', (ws) => {
 
         currentSession.dgSocket.on('error', (err) => {
             console.error(`Session ${currentSession.id}: Deepgram error:`, err);
-            handleDeepgramReconnect(currentSession);
+            // handleDeepgramReconnect(currentSession);
         });
 
         currentSession.dgSocket.on('close', () => {
             console.log(`Session ${currentSession.id}: Deepgram connection closed.`);
-            handleDeepgramReconnect(currentSession);
+            // handleDeepgramReconnect(currentSession);
         });
     };
 
@@ -597,6 +1047,7 @@ wss.on('connection', (ws) => {
                 session.streamSid = parsedData.streamSid; // Confirm streamSid in session
 
                 console.log(`Session ${sessionId}: Twilio stream started for CallSid: ${session.callSid}`);
+                // console.log(parsedData.caller);
 
                 // Initialize per-session FFmpeg and VAD processes
                 session.ffmpegProcess = spawn('ffmpeg', [
