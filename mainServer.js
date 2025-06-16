@@ -5,7 +5,23 @@ require('dotenv').config(); // Make sure your .env file has all the necessary ke
 const { PollyClient, SynthesizeSpeechCommand } = require("@aws-sdk/client-polly");
 const OpenAI = require("openai");
 const twilio = require('twilio'); // This might not be directly used in the WebSocket server, but kept for consistency
+const { createSessionId, verifySessionId } = require('./sessionId.js')
+const { Client } = require('pg');
 
+const client = new Client({
+    user: 'postgres',
+    host: 'localhost',
+    database: 'ai_testbench',
+    password: 'postgresql',
+    port: 5432, // Default PostgreSQL port
+});
+
+client.connect()
+    .then(() => console.log('Connected to PostgreSQL!'))
+    .then(() => client.query('SELECT NOW()'))
+    .then(res => console.log('Current time:', res.rows[0]))
+    .catch(err => console.error('Connection error:', err.stack))
+    .finally(() => client.end());
 
 const SHOPIFY_STORE_URL = process.env.SHOPIFY_STORE_URL;
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
@@ -25,11 +41,13 @@ const toolDefinitions = [
     {
         type: "function",
         name: "getUserDetailsByPhoneNo",
-        description: "Get customer details",
+        description: "Get customer details by phone number.",
         parameters: {
             type: "object",
-            properties: {},
-            required: []
+            properties: {
+                phone: { type: "string", description: "The customer's phone number." }
+            },
+            required: ["phone"]
         }
     },
     {
@@ -129,69 +147,45 @@ const functions = {
         return products;
     },
 
-    // async getUserDetailsByPhoneNo(phone) {
-    //     const query = `
-    //     {
-    //       customers(first: 1, query: "phone:${phone}") {
-    //         edges {
-    //           node {
-    //             id
-    //             firstName
-    //             lastName
-    //             email
-    //             phone
-    //             numberOfOrders
-    //           }
-    //         }
-    //       }
-    //     }
-    //     `;
-
-    //     const response = await fetch(graphqlEndpoint, {
-    //         method: 'POST',
-    //         headers: {
-    //             'Content-Type': 'application/json',
-    //             'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
-    //         },
-    //         body: JSON.stringify({ query }),
-    //     });
-
-    //     const data = await response.json();
-    //     if (!data.data || !data.data.customers.edges.length) return null;
-
-    //     const user = data.data.customers.edges[0].node;
-    //     return {
-    //         id: user.id,
-    //         firstName: user.firstName,
-    //         lastName: user.lastName,
-    //         email: user.email,
-    //         phone: user.phone,
-    //         ordersCount: user.ordersCount
-    //     };
-    // },
-
     async getUserDetailsByPhoneNo(phone) {
-        try {
-            // console.log(`http://localhost:3000/getuser/search?${encodeURIComponent(phone)}`)
-            const response = await fetch(`http://localhost:3000/getuser/search?phone=${encodeURIComponent(phone)}`);
-
-            if (!response.ok) {
-                console.error('User not found or error occurred:', response.status);
-                return null;
+        const query = `
+        {
+          customers(first: 1, query: "phone:${phone}") {
+            edges {
+              node {
+                id
+                firstName
+                lastName
+                email
+                phone
+                numberOfOrders
+              }
             }
-
-            const user = await response.json();
-            console.log(user[0].name)
-            return {
-                id: user[0].user_id,
-                name: user[0].name,
-                email: user[0].email,
-                phone: user[0].phone,// Optional, if you have this in DB
-            };
-        } catch (error) {
-            console.error('❌ Error fetching user by phone from API:', error);
-            return null;
+          }
         }
+        `;
+
+        const response = await fetch(graphqlEndpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+            },
+            body: JSON.stringify({ query }),
+        });
+
+        const data = await response.json();
+        if (!data.data || !data.data.customers.edges.length) return null;
+
+        const user = data.data.customers.edges[0].node;
+        return {
+            id: user.id,
+            firstName: user.firstName,
+            lastName: user.lastName,
+            email: user.email,
+            phone: user.phone,
+            ordersCount: user.ordersCount
+        };
     },
 
     async getAllOrders(cursor = null) {
@@ -416,6 +410,28 @@ class SessionManager {
             chatHistory: [{
                 A: "Hello! You are speaking to an AI assistant."
             }],
+            // AI prompt, specific to each session
+            //             prompt: `
+            // You are a helpful assistant. Generate your response in JSON format containing two major parts: 1) "response" (your textual reply) and 2) "output_channel" (the medium for the response). For example:
+            // {
+            //   "response": "Your response for the user message",
+            //   "output_channel": "audio"
+            // }
+
+            // The "output_channel" must be one of the available channels. Currently, only "audio" is available. Always prioritize the input channel if suitable for the response.
+
+            // The user's message will be a JSON object with "message" and "input_channel". For example:
+            // {
+            //   "message": "User's message",
+            //   "input_channel": "audio"
+            // }
+
+            // I will provide you with the chat history and the current user message. The chat history will be structured like this:
+            // [
+            //   { "A": "Assistant Message" },
+            //   { "U": "User Message" }
+            // ]
+            // `,
             prompt: `You are a helpful AI assistant for the Shopify store "Gautam Garment". You have access to several tools (functions) that let you fetch and provide real-time information about products, orders, and customers from the store.
 
 Your Tasks:
@@ -464,8 +480,14 @@ The store name is "Gautam Garment"—refer to it by name in your responses when 
         return session;
     }
 
-    getSession(sessionId) {
-        return this.sessions.get(sessionId);
+    getSessions(sessionId, ws) {
+        if (this.sessions.has(sessionId)) {
+            console.log(`Session ${sessionId}: Found existing session.`);
+            return this.sessions.get(sessionId);
+        } else {
+            console.log(`Session ${sessionId}: No session found. Creating new session.`);
+            return this.createSession(sessionId, ws);
+        }
     }
 
     deleteSession(sessionId) {
@@ -610,53 +632,6 @@ const audioUtils = {
 
 // AI Processing
 const aiProcessing = {
-    // async processInput(input, session) {
-    //     try {
-    //         session.currentMessage = input;
-    //         session.chatHistory.push({ U: input.message });
-
-    //         // Prepare messages for OpenAI
-    //         const messages = [
-    //             { role: "system", content: session.prompt },
-    //             { role: "user", content: JSON.stringify({ chatHistory: session.chatHistory, currentMessage: session.currentMessage }) }
-    //         ];
-
-    //         const startTime = Date.now();
-    //         const response = await services.openai.chat.completions.create({
-    //             model: CONFIG.GPT_MODEL,
-    //             messages: messages,
-    //             temperature: CONFIG.GPT_TEMPERATURE,
-    //             max_tokens: CONFIG.GPT_MAX_TOKENS,
-    //             response_format: { type: "json_object" } // Request JSON object directly
-    //         });
-    //         const latency = Date.now() - startTime;
-    //         session.metrics.llm = latency;
-
-    //         let parsedData;
-    //         try {
-    //             parsedData = JSON.parse(response.choices[0].message.content);
-    //             console.log(`Session ${session.id}: LLM Raw Response:`, response.choices[0].message.content);
-    //             console.log(`Session ${session.id}: Parsed LLM response:`, parsedData.response);
-    //             console.log(`Session ${session.id}: Parsed LLM output channel:`, parsedData.output_channel);
-    //             session.chatHistory.push({ A: parsedData.response });
-    //             return { processedText: parsedData.response, outputType: parsedData.output_channel };
-    //         } catch (error) {
-    //             console.error(`Session ${session.id}: Error parsing LLM JSON response:`, error);
-    //             console.log(`Session ${session.id}: Attempting to use raw LLM content:`, response.choices[0].message.content);
-    //             session.chatHistory.push({ A: response.choices[0].message.content });
-    //             // Fallback if JSON parsing fails
-    //             return {
-    //                 processedText: response.choices[0].message.content || "Sorry, I had trouble understanding. Could you please rephrase?",
-    //                 outputType: 'audio' // Default to audio if parsing fails
-    //             };
-    //         }
-    //     } catch (error) {
-    //         console.error(`Session ${session.id}: Error processing input with OpenAI:`, error);
-    //         // Fallback for API errors
-    //         return { processedText: "I'm having trouble connecting right now. Please try again later.", outputType: 'audio' };
-    //     }
-    // },
-
     async processInput(input, session) {
         // On the first user message, previous_response_id will be undefined.
         // On subsequent turns, set previous_response_id to maintain context.
@@ -686,7 +661,7 @@ const aiProcessing = {
             if (response.output[0].name === "getAllProducts") {
                 toolResult = await functions.getAllProducts();
             } else if (response.output[0].name === "getUserDetailsByPhoneNo") {
-                toolResult = await functions.getUserDetailsByPhoneNo(session.caller);
+                toolResult = await functions.getUserDetailsByPhoneNo(args.phone);
             } else if (response.output[0].name === "getAllOrders") {
                 toolResult = await functions.getAllOrders();
             } else if (response.output[0].name === "getOrderById") {
@@ -860,10 +835,7 @@ wss.on('connection', (ws, req) => {
                                 );
 
                                 if (outputType === 'audio') {
-                                    currentSession.isAIResponding = false;
-                                    currentSession.interruption = true;
-                                    handleInterruption(currentSession);
-                                    currentSession.currentAudioStream = null;
+                                    currentSession.isAIResponding = true;
                                     const audioBuffer = await aiProcessing.synthesizeSpeech(processedText, currentSession.id);
                                     if (!audioBuffer) {
                                         console.error(`Session ${currentSession.id}: Failed to synthesize speech.`);
@@ -872,7 +844,6 @@ wss.on('connection', (ws, req) => {
                                     }
                                     const mulawBuffer = await audioUtils.convertMp3ToMulaw(audioBuffer, currentSession.id);
                                     if (mulawBuffer) {
-                                        currentSession.interruption = false;
                                         audioUtils.streamMulawAudioToTwilio(ws, currentSession.streamSid, mulawBuffer, currentSession);
                                     } else {
                                         console.error(`Session ${currentSession.id}: Failed to convert audio to mulaw.`);
@@ -992,8 +963,8 @@ wss.on('connection', (ws, req) => {
 
             if (parsedData.event === 'start') {
                 // console.log('start',parsedData);
-                sessionId = parsedData.streamSid;
-                session = sessionManager.createSession(sessionId, ws); // Pass ws to session manager
+                sessionId = createSessionId(parsedData.start.customParameters.caller);
+                session = sessionManager.getSessions(sessionId, ws); // Pass ws to session manager
                 session.callSid = parsedData.start.callSid;
                 session.streamSid = parsedData.streamSid; // Confirm streamSid in session
                 session.caller = parsedData.start.customParameters.caller;
@@ -1007,7 +978,7 @@ wss.on('connection', (ws, req) => {
                     '-f', 'mulaw', // Input format from Twilio
                     '-ar', CONFIG.AUDIO_SAMPLE_RATE.toString(), // Input sample rate from Twilio
                     '-ac', '1', // Input channels
-                    '-i', 'pipe:0', // Input from stdin
+                    '-i', 'pipe:0', // Input from stdins
                     '-f', 's16le', // Output format for VAD/Deepgram
                     '-acodec', 'pcm_s16le', // Output codec
                     '-ar', CONFIG.SAMPLE_RATE.toString(), // Output sample rate for VAD/Deepgram
@@ -1098,7 +1069,7 @@ wss.on('connection', (ws, req) => {
                 // console.log(userDetails);
                 let announcementText = session.chatHistory[0].A; // Get initial message from chat history
                 if (userDetails) {
-                    announcementText = `Hello ${userDetails.name}, welcome to the Gautam Garments. How can I help you today?`;
+                    announcementText = `Hello ${userDetails.firstName}, welcome to the Gautam Garments. How can I help you today?`;
                 }
 
                 const mp3Buffer = await aiProcessing.synthesizeSpeech(announcementText, session.id);

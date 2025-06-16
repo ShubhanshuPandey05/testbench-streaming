@@ -4,6 +4,7 @@ import './App.css';
 const App = () => {
   const [recording, setRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
+  const [sessionId, setSessionId] = useState(null);
   const [transcript, setTranscript] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
   const [error, setError] = useState(null);
@@ -21,7 +22,6 @@ const App = () => {
   const INTERIM_THRESHOLD = 500;
   const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
-  // const [isChatActive, setIsChatActive] = useState(false);
   const [latency, setLatency] = useState({
     llm: 0,
     stt: 0,
@@ -42,7 +42,12 @@ const App = () => {
   }, [transcript, interimTranscript]);
 
   const cleanup = () => {
-    if (wsRef.current) {
+    if (wsRef.current && sessionId) {
+      // Send stop session message before closing
+      wsRef.current.send(JSON.stringify({
+        type: 'stop_session',
+        sessionId: sessionId
+      }));
       wsRef.current.close();
     }
     if (mediaRecorderRef.current) {
@@ -128,9 +133,13 @@ const App = () => {
 
   const handleChatSubmit = (e) => {
     e.preventDefault();
-    setChatMessages([...chatMessages, { role: 'user', content: chatInput }]);
+    if (!chatInput.trim() || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    setChatMessages(prev => [...prev, { role: 'user', content: chatInput }]);
     console.log('Sending chat message:', chatInput);
-    // console.log(wsRef.current);
+    
     wsRef.current.send(JSON.stringify({
       type: 'chat',
       message: chatInput
@@ -154,31 +163,45 @@ const App = () => {
       });
       setupAudioAnalysis(stream);
 
-      // wsRef.current = new WebSocket('wss://a31a-2401-4900-1c80-9450-6c61-8e74-1d49-209a.ngrok-free.app');
+      // Connect to WebSocket
       wsRef.current = new WebSocket('ws://localhost:5001');
       let reconnectTimeout = null;
 
       wsRef.current.onopen = () => {
-        setIsConnected(true);
-        mediaRecorderRef.current = new MediaRecorder(stream, {
-          mimeType: 'audio/webm;codecs=opus',
-        });
-
-        mediaRecorderRef.current.ondataavailable = (e) => {
-          if (e.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(e.data);
-          }
-        };
-
-        mediaRecorderRef.current.start(50);
-        setRecording(true);
+        console.log('WebSocket connected, starting session...');
+        
+        // Initialize session with the server
+        wsRef.current.send(JSON.stringify({
+          type: 'start_session'
+        }));
       };
 
       wsRef.current.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          console.log('Received message:', data);
 
-          if (data.type === 'audio') {
+          if (data.type === 'session_started') {
+            // Session initialized successfully
+            setSessionId(data.sessionId);
+            setIsConnected(true);
+            console.log('Session started with ID:', data.sessionId);
+
+            // Now start recording
+            mediaRecorderRef.current = new MediaRecorder(stream, {
+              mimeType: 'audio/webm;codecs=opus',
+            });
+
+            mediaRecorderRef.current.ondataavailable = (e) => {
+              if (e.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
+                wsRef.current.send(e.data);
+              }
+            };
+
+            mediaRecorderRef.current.start(50);
+            setRecording(true);
+
+          } else if (data.type === 'audio') {
             // Convert base64 to ArrayBuffer
             const binaryString = window.atob(data.audio);
             const bytes = new Uint8Array(binaryString.length);
@@ -187,15 +210,21 @@ const App = () => {
             }
 
             // Queue the audio with its type (interim or final)
-            queueAudio(bytes.buffer, data.isFinal);
-            console.log('latency', data.latency);
-            setLatency({
-              llm: data.latency.llm,
-              stt: data.latency.stt,
-              tts: data.latency.tts
-            });
+            queueAudio(bytes.buffer, !data.isFinal);
+            
+            if (data.latency) {
+              console.log('Latency:', data.latency);
+              setLatency({
+                llm: data.latency.llm || 0,
+                stt: data.latency.stt || 0,
+                tts: data.latency.tts || 0
+              });
+            }
+
           } else if (data.type === 'tts_error') {
             console.error('TTS Error:', data.error);
+            setError('TTS Error: ' + data.error);
+
           } else if (data.transcript) {
             if (data.isInterim) {
               setInterimTranscript(data.transcript);
@@ -203,28 +232,37 @@ const App = () => {
               setTranscript(prev => prev + ' ' + data.transcript);
               setInterimTranscript('');
             }
-          } else if (data.type === 'text') {
-            console.log('text', data.text);
+
+          } else if (data.type === 'text' || data.type === 'text_response') {
+            console.log('Text response:', data.text);
             setChatMessages(prev => [...prev, { role: 'assistant', content: data.text }]);
+
           } else if (data.error) {
             setError(data.error);
+            console.error('Server error:', data.error);
           }
+
         } catch (err) {
           console.error('Error parsing WebSocket message:', err);
+          setError('Error parsing server response');
         }
       };
 
       wsRef.current.onerror = (error) => {
-        setError('WebSocket error occurred');
+        setError('WebSocket connection error');
         console.error('WebSocket error:', error);
       };
 
-      wsRef.current.onclose = () => {
+      wsRef.current.onclose = (event) => {
+        console.log('WebSocket closed:', event.code, event.reason);
         setIsConnected(false);
-        if (recording) {
-          // Attempt to reconnect after 2 seconds
+        setSessionId(null);
+        
+        if (recording && !event.wasClean) {
+          // Attempt to reconnect after 2 seconds if connection was lost unexpectedly
           reconnectTimeout = setTimeout(() => {
             if (recording) {
+              console.log('Attempting to reconnect...');
               startRecording();
             }
           }, 2000);
@@ -232,7 +270,7 @@ const App = () => {
       };
 
     } catch (err) {
-      setError('Failed to access microphone');
+      setError('Failed to access microphone: ' + err.message);
       console.error('Error accessing microphone:', err);
     }
   };
@@ -241,6 +279,7 @@ const App = () => {
     cleanup();
     setRecording(false);
     setIsConnected(false);
+    setSessionId(null);
     setAudioLevel(0);
     setInterimTranscript('');
   };
@@ -249,55 +288,23 @@ const App = () => {
     setTranscript('');
     setInterimTranscript('');
   };
-  // const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  // let audioQueue = [];
-  // let playing = false;
-
-  // // const ws = new WebSocket('ws://localhost:5001');
-  // wsRef.binaryType = 'arraybuffer';
-
-  // wsRef.current.onmessage = async (event) => {
-  //   if (typeof event.data === 'string') {
-  //     const msg = JSON.parse(event.data);
-  //     if (msg.type === 'end') return; // End of stream
-  //   } else {
-  //     audioQueue.push(event.data);
-  //     if (!playing) playNextChunk();
-  //   }
-  // };
-
-  // async function playNextChunk() {
-  //   if (audioQueue.length === 0) {
-  //     playing = false;
-  //     return;
-  //   }
-  //   playing = true;
-  //   const chunk = audioQueue.shift();
-  //   const audioBuffer = await audioContext.decodeAudioData(chunk);
-  //   const source = audioContext.createBufferSource();
-  //   source.buffer = audioBuffer;
-  //   source.connect(audioContext.destination);
-  //   source.onended = playNextChunk;
-  //   source.start();
-  // }
-
-
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 to-gray-800 text-white p-6">
-
       {/* Header */}
       <header className="mb-6 text-center">
         <h1 className="text-3xl font-extrabold tracking-wide">🎙️ Voice Agent Dashboard</h1>
         <p className="text-sm text-gray-400 mt-1">Monitor, Record & Interact</p>
+        {sessionId && (
+          <p className="text-xs text-blue-400 mt-1">Session: {sessionId}</p>
+        )}
       </header>
 
       {/* Status Card */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
         <div className="bg-white/10 backdrop-blur-md p-4 rounded-xl border border-white/20 shadow-md">
           <p className="text-sm text-gray-300">Connection</p>
-          <div className={`mt-1 text-lg font-bold ${isConnected ? 'text-green-400' : 'text-red-400'
-            }`}>
+          <div className={`mt-1 text-lg font-bold ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
             {isConnected ? 'Connected' : 'Disconnected'}
           </div>
           {error && <div className="mt-2 text-red-300 text-sm">{error}</div>}
@@ -308,8 +315,7 @@ const App = () => {
           <p className="text-sm text-gray-300 mb-1">Audio Level</p>
           <div className="w-full bg-gray-600 h-3 rounded-full overflow-hidden">
             <div
-              className={`h-full transition-all duration-500 ${recording ? 'bg-green-500' : 'bg-gray-300'
-                }`}
+              className={`h-full transition-all duration-500 ${recording ? 'bg-green-500' : 'bg-gray-300'}`}
               style={{ width: `${audioLevel}%` }}
             ></div>
           </div>
@@ -366,28 +372,32 @@ const App = () => {
       <div className="bg-white/10 backdrop-blur-md p-6 rounded-xl border border-white/20 shadow-md">
         <h2 className="text-2xl font-bold mb-4">💬 Chat</h2>
         <div className="h-40 bg-white/5 rounded-lg overflow-y-auto p-3 mb-4 text-sm text-gray-200 border border-white/10">
-          <div className="chat-messages"></div>
+          {chatMessages.map((msg, index) => (
+            <div key={index} className={`mb-2 ${msg.role === 'user' ? 'text-blue-300' : 'text-green-300'}`}>
+              <strong>{msg.role === 'user' ? 'You' : 'Assistant'}:</strong> {msg.content}
+            </div>
+          ))}
         </div>
-        <div className="flex gap-2">
+        <form onSubmit={handleChatSubmit} className="flex gap-2">
           <input
             type="text"
             placeholder="Type your message..."
             value={chatInput}
             onChange={handleChatInput}
-            className="flex-1 bg-white/10 text-white placeholder-gray-400 px-4 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"
+            disabled={!isConnected}
+            className="flex-1 bg-white/10 text-white placeholder-gray-400 px-4 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:opacity-50"
           />
           <button
-            onClick={handleChatSubmit}
-            className="bg-blue-600 hover:bg-blue-700 transition px-5 py-2 rounded-lg font-semibold shadow"
+            type="submit"
+            disabled={!isConnected || !chatInput.trim()}
+            className="bg-blue-600 hover:bg-blue-700 transition px-5 py-2 rounded-lg font-semibold shadow disabled:opacity-50 disabled:cursor-not-allowed"
           >
             Send
           </button>
-        </div>
+        </form>
       </div>
     </div>
   );
-
-
 };
 
 export default App;
