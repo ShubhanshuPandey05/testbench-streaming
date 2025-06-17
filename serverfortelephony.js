@@ -704,7 +704,7 @@ const audioUtils = {
     },
 
     streamMulawAudioToTwilio: function (ws, streamSid, mulawBuffer, session) {
-        const CHUNK_SIZE_MULAW = 1600; // 20ms of 8khz mulaw (8000 samples/sec * 0.020 sec = 160 samples, 1 byte/sample)
+        const CHUNK_SIZE_MULAW = 800; // 20ms of 8khz mulaw (8000 samples/sec * 0.020 sec = 160 samples, 1 byte/sample)
         let offset = 0;
         session.isAIResponding = true;
         session.interruption = false; // Reset interruption flag when AI starts speaking
@@ -743,7 +743,7 @@ const audioUtils = {
                 }));
                 offset += CHUNK_SIZE_MULAW;
                 // Schedule next chunk slightly faster than chunk duration for continuous flow
-                setTimeout(sendChunk, 200); // 180ms delay for 200ms chunk
+                setTimeout(sendChunk, 100); // 180ms delay for 200ms chunk
             } catch (error) {
                 console.error(`Session ${session.id}: Error sending audio chunk:`, error);
                 stopFunction(); // Stop on error
@@ -1029,10 +1029,15 @@ wss.on('connection', (ws, req) => {
                     console.log(`Session ${currentSession.id}: Received final segment. Current utterance: "${currentSession.currentUserUtterance}"`);
 
                     // 2. Prepare the conversation history for the turn detector.
+                    if(currentSession.chatHistory.length > 1){
+                        currentSession.chatHistory.shift()
+                        // currentSession.chatHistory.shift()
+                    }
                     const messagesForDetection = [
                         ...currentSession.chatHistory,
                         { role: 'user', content: currentSession.currentUserUtterance }
                     ];
+                    console.log(messagesForDetection);
 
                     // 3. Ask the service if the turn is complete.
                     const isComplete = await turnService.isConversationComplete(messagesForDetection);

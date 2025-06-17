@@ -14,7 +14,7 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 class ConversationTurnDetector:
     def __init__(self):
         try:
-            checkpoint = "HuggingFaceTB/SmolLM-1.7B"
+            checkpoint = "HuggingFaceTB/SmolLM-1.7B-Instruct"
             self.device = "cpu"
             
             print("Loading tokenizer...", file=sys.stderr)
