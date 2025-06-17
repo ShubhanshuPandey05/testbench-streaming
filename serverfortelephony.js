@@ -11,6 +11,148 @@ const SHOPIFY_STORE_URL = process.env.SHOPIFY_STORE_URL;
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 const graphqlEndpoint = `https://${SHOPIFY_STORE_URL}/admin/api/2023-01/graphql.json`;
 
+
+const readline = require('readline');
+
+class ConversationTurnDetector {
+    constructor(pythonScriptPath = './turn.py') {
+        this.pythonScriptPath = pythonScriptPath;
+        this.pythonProcess = null;
+        this.isReady = false;
+        this.requestQueue = [];
+    }
+
+    async initialize() {
+        return new Promise((resolve, reject) => {
+            console.log('Initializing conversation turn detector...');
+
+            // Spawn Python process in interactive mode
+            this.pythonProcess = spawn("D:/work/ship-fast.studio/livekit turnDetector/temp/Scripts/python.exe", [this.pythonScriptPath], {
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+
+            // Listen for initialization completion
+            this.pythonProcess.stderr.on('data', (data) => {
+                const message = data.toString();
+                console.log('Python stderr:', message.trim());
+
+                if (message.includes('Conversation turn detector ready!')) {
+                    this.isReady = true;
+                    this.setupResponseHandler();
+                    resolve();
+                }
+            });
+
+            this.pythonProcess.on('error', (error) => {
+                console.error('Python process error:', error);
+                reject(error);
+            });
+
+            this.pythonProcess.on('close', (code) => {
+                console.log(`Python process exited with code ${code}`);
+                this.isReady = false;
+            });
+
+            // Timeout for initialization
+            setTimeout(() => {
+                if (!this.isReady) {
+                    reject(new Error('Turn detector initialization timeout'));
+                }
+            }, 120000); // 2 minute timeout for model loading
+        });
+    }
+
+    setupResponseHandler() {
+        const rl = readline.createInterface({
+            input: this.pythonProcess.stdout,
+            crlfDelay: Infinity
+        });
+
+        rl.on('line', (line) => {
+            this.handleResponse(line.trim());
+        });
+    }
+
+    handleResponse(response) {
+        if (this.requestQueue.length > 0) {
+            const { resolve } = this.requestQueue.shift();
+            const result = response === 'true';
+            resolve(result);
+        }
+    }
+
+    async detectTurnCompletion(messages) {
+        if (!this.isReady) {
+            throw new Error('Turn detector not initialized');
+        }
+
+        return new Promise((resolve, reject) => {
+            // Add to queue
+            this.requestQueue.push({ resolve, reject });
+
+            // Send messages as JSON to Python process
+            const messagesJson = JSON.stringify(messages);
+            this.pythonProcess.stdin.write(messagesJson + '\n');
+
+            // Timeout for individual requests
+            setTimeout(() => {
+                const index = this.requestQueue.findIndex(req => req.resolve === resolve);
+                if (index !== -1) {
+                    this.requestQueue.splice(index, 1);
+                    reject(new Error('Turn detection timeout'));
+                }
+            }, 10000); // 10 second timeout per request
+        });
+    }
+
+    destroy() {
+        if (this.pythonProcess) {
+            this.pythonProcess.stdin.write('exit\n');
+            this.pythonProcess.kill();
+            this.pythonProcess = null;
+            this.isReady = false;
+        }
+    }
+}
+
+class ConversationTurnService {
+    constructor() {
+        this.detector = null;
+        this.initialized = false;
+    }
+
+    async init() {
+        if (!this.initialized) {
+            this.detector = new ConversationTurnDetector('./turn.py');
+            await this.detector.initialize();
+            this.initialized = true;
+            console.log('Conversation Turn Detection Service ready!');
+        }
+    }
+
+    async isConversationComplete(messages) {
+        if (!this.initialized) {
+            await this.init();
+        }
+        return await this.detector.detectTurnCompletion(messages);
+    }
+
+    shutdown() {
+        if (this.detector) {
+            this.detector.destroy();
+            this.initialized = false;
+        }
+    }
+}
+
+const turnService = new ConversationTurnService();
+async function main() {
+    console.log('Initializing Conversation Turn Detection Service...');
+    await turnService.init(); // This will load the model
+    console.log('✅ Turn Detection Service is ready.');
+}
+main();
+
 const toolDefinitions = [
     {
         type: "function",
@@ -414,7 +556,8 @@ class SessionManager {
             phoneNo: '',
             currentMessage: {},
             chatHistory: [{
-                A: "Hello! You are speaking to an AI assistant."
+                role: 'assistant',
+                content: "Hello! You are speaking to an AI assistant for Gautam Garment."
             }],
             prompt: `You are a helpful AI assistant for the Shopify store "Gautam Garment". You have access to several tools (functions) that let you fetch and provide real-time information about products, orders, and customers from the store.
 
@@ -456,8 +599,10 @@ The store name is "Gautam Garment"—refer to it by name in your responses when 
             // Per-session child processes for audio handling
             ffmpegProcess: null,
             vadProcess: null,
+            turndetectionprocess: null,
             vadDeepgramBuffer: Buffer.alloc(0), // Buffer for audio chunks after VAD/FFmpeg processing
-            isVadSpeechActive: false, // VAD's internal speech detection status
+            isVadSpeechActive: false,
+            currentUserUtterance: '', // VAD's internal speech detection status
         };
         this.sessions.set(sessionId, session);
         console.log(`Session ${sessionId}: Created new session.`);
@@ -788,15 +933,73 @@ wss.on('connection', (ws, req) => {
         });
     }, 10000); // Send keep-alive every 10 seconds
 
-    // Function to establish Deepgram connection for a specific session
-    const connectToDeepgram = (currentSession) => {
+    async function handleTurnCompletion(session) {
+        const finalTranscript = session.currentUserUtterance;
+        if (!finalTranscript) return; // Do nothing if there's no transcript
+
+        console.log(`Session ${session.id}: Turn complete. Processing final transcript: "${finalTranscript}"`);
+
+        // 1. Add the complete user message to the official chat history
+        session.chatHistory.push({ role: 'user', content: finalTranscript });
+
+        // 2. Reset the utterance buffer for the next turn
+        session.currentUserUtterance = '';
+
+        // // 3. Send final transcript to client for display (optional, but good practice)
+        // ws.send(JSON.stringify({
+        //     type: 'final_transcript',
+        //     transcript: finalTranscript,
+        //     isFinal: true
+        // }));
+
+        try {
+            // 4. Get the AI's response
+            const { processedText, outputType } = await aiProcessing.processInput(
+                { message: finalTranscript, input_channel: 'audio' },
+                session
+            );
+
+            // 5. Add AI response to chat history
+            session.chatHistory.push({ role: 'assistant', content: processedText });
+
+            if (outputType === 'audio') {
+                // Your existing audio response logic
+                handleInterruption(session); // Stop any ongoing AI speech
+                const audioBuffer = await aiProcessing.synthesizeSpeech(processedText, session.id);
+                if (!audioBuffer) throw new Error("Failed to synthesize speech.");
+
+                const mulawBuffer = await audioUtils.convertMp3ToMulaw(audioBuffer, session.id);
+                if (mulawBuffer) {
+                    session.interruption = false;
+                    audioUtils.streamMulawAudioToTwilio(ws, session.streamSid, mulawBuffer, session);
+                } else {
+                    throw new Error("Failed to convert audio to mulaw.");
+                }
+            } else {
+                // Handle text output
+                ws.send(JSON.stringify({
+                    type: 'ai_response_text',
+                    text: processedText,
+                }));
+                session.isAIResponding = false;
+            }
+        } catch (err) {
+            console.error(`Session ${session.id}: Error during turn completion handling:`, err);
+            ws.send(JSON.stringify({ type: 'error', error: err.message }));
+            session.isAIResponding = false;
+        }
+    }
+
+
+    // REFACTORED: Your connectToDeepgram function with turn detection integrated.
+    const connectToDeepgram = (currentSession) => { // Pass 'ws' as an argument
         if (!currentSession || !currentSession.id) {
             console.error('Attempted to connect to Deepgram without a valid session.');
             return;
         }
 
         if (currentSession.dgSocket && currentSession.dgSocket.readyState === WebSocket.OPEN) {
-            currentSession.dgSocket.close(); // Close existing socket if open
+            currentSession.dgSocket.close();
         }
 
         currentSession.dgSocket = new WebSocket(
@@ -806,111 +1009,51 @@ wss.on('connection', (ws, req) => {
 
         currentSession.dgSocket.on('open', () => {
             console.log(`Session ${currentSession.id}: ✅ Deepgram connected.`);
-            currentSession.reconnectAttempts = 0;
         });
 
         currentSession.dgSocket.on('message', async (data) => {
             try {
                 const received = JSON.parse(data);
+                const transcript = received.channel?.alternatives?.[0]?.transcript;
 
-                // Update global performance metrics based on Deepgram final results
-                if (received.is_final && currentSession.audioStartTime) {
-                    performance.updateStats(Date.now() - currentSession.audioStartTime);
-                    currentSession.audioStartTime = null; // Reset for next utterance
-                }
+                if (!transcript) return;
 
-                if (received.channel?.alternatives?.[0]?.transcript) {
-                    const transcript = received.channel.alternatives[0].transcript;
-                    // const confidence = received.channel?.alternatives?.[0]?.confidence || 0; // Not used for interim filtering
-                    const now = Date.now();
+                // --- THIS IS THE CORE LOGIC CHANGE ---
+                if (received.is_final) {
+                    // A segment of speech has ended. We now check if it completes the user's turn.
+                    currentSession.isSpeaking = false;
+                    currentSession.lastInterimTranscript = '';
 
-                    if (received.is_final) {
-                        // Handle final transcript
-                        currentSession.isSpeaking = false; // User has finished speaking (Deepgram final)
-                        currentSession.lastInterimTranscript = ''; // Clear interim for next turn
-                        currentSession.interimResultsBuffer = []; // Clear buffer
+                    // 1. Append the new final segment to the ongoing utterance buffer.
+                    currentSession.currentUserUtterance += (currentSession.currentUserUtterance ? ' ' : '') + transcript;
+                    console.log(`Session ${currentSession.id}: Received final segment. Current utterance: "${currentSession.currentUserUtterance}"`);
 
-                        // If you had a silence timer, clear it here (not used in this version)
-                        // if (currentSession.silenceTimer) {
-                        //     clearTimeout(currentSession.silenceTimer);
-                        //     currentSession.silenceTimer = null;
-                        // }
+                    // 2. Prepare the conversation history for the turn detector.
+                    const messagesForDetection = [
+                        ...currentSession.chatHistory,
+                        { role: 'user', content: currentSession.currentUserUtterance }
+                    ];
 
-                        if (transcript.trim().length > 0 && transcript !== currentSession.lastTranscript) {
-                            currentSession.transcriptBuffer.push(transcript);
-                            currentSession.lastTranscript = transcript;
-                        }
+                    // 3. Ask the service if the turn is complete.
+                    const isComplete = await turnService.isConversationComplete(messagesForDetection);
 
-                        if (currentSession.transcriptBuffer.length > 0) {
-                            const finalTranscript = currentSession.transcriptBuffer.join(' ').trim();
-                            currentSession.userSpeak = true;
-                            console.log(`Session ${currentSession.id}: Final Transcript: "${finalTranscript}"`);
+                    if (isComplete) {
+                        // YES, the turn is complete. Process the full utterance.
+                        await handleTurnCompletion(currentSession);
+                    } else {
+                        // NO, the user just paused. Wait for them to continue.
+                        console.log(`Session ${currentSession.id}: ⏳ Turn NOT complete. Waiting for more input.`);
+                    }
 
-                            // Send final transcript back to the Twilio stream (e.g., for display/debugging)
-                            ws.send(JSON.stringify({
-                                type: 'final_transcript',
-                                transcript: finalTranscript,
-                                isFinal: true
-                            }));
-
-                            try {
-                                const { processedText, outputType } = await aiProcessing.processInput(
-                                    { message: finalTranscript, input_channel: 'audio' },
-                                    currentSession
-                                );
-
-                                if (outputType === 'audio') {
-                                    currentSession.isAIResponding = false;
-                                    currentSession.interruption = true;
-                                    handleInterruption(currentSession);
-                                    currentSession.currentAudioStream = null;
-                                    const audioBuffer = await aiProcessing.synthesizeSpeech(processedText, currentSession.id);
-                                    if (!audioBuffer) {
-                                        console.error(`Session ${currentSession.id}: Failed to synthesize speech.`);
-                                        currentSession.isAIResponding = false;
-                                        return;
-                                    }
-                                    const mulawBuffer = await audioUtils.convertMp3ToMulaw(audioBuffer, currentSession.id);
-                                    if (mulawBuffer) {
-                                        currentSession.interruption = false;
-                                        audioUtils.streamMulawAudioToTwilio(ws, currentSession.streamSid, mulawBuffer, currentSession);
-                                    } else {
-                                        console.error(`Session ${currentSession.id}: Failed to convert audio to mulaw.`);
-                                        currentSession.isAIResponding = false;
-                                    }
-                                } else {
-                                    // Handle text output if your Twilio integration can display it
-                                    ws.send(JSON.stringify({
-                                        type: 'ai_response_text',
-                                        text: processedText,
-                                        isFinal: true,
-                                        latency: currentSession.metrics
-                                    }));
-                                    currentSession.isAIResponding = false;
-                                }
-                            } catch (err) {
-                                console.error(`Session ${currentSession.id}: AI Processing or TTS error:`, err);
-                                ws.send(JSON.stringify({
-                                    type: 'error',
-                                    error: 'Failed to process AI response or synthesize speech.'
-                                }));
-                                currentSession.isAIResponding = false;
-                            }
-                            currentSession.transcriptBuffer = []; // Clear buffer after processing
-                        }
-                    } else { // It's an interim result
-                        // Send interim transcript immediately to Twilio client if new and not empty
-                        if (transcript.trim().length > 0 && transcript !== currentSession.lastInterimTranscript) {
-                            currentSession.isSpeaking = true; // User is speaking
-                            currentSession.lastInterimTime = now;
-                            currentSession.lastInterimTranscript = transcript;
-
-                            ws.send(JSON.stringify({
-                                type: 'interim_transcript',
-                                transcript: transcript,
-                                isInterim: true
-                            }));
-                        }
+                } else { // This is an interim result.
+                    // Interim logic remains the same - it's great for UI feedback.
+                    if (transcript.trim() && transcript !== currentSession.lastInterimTranscript) {
+                        currentSession.isSpeaking = true;
+                        currentSession.lastInterimTranscript = transcript;
+                        ws.send(JSON.stringify({
+                            type: 'interim_transcript',
+                            transcript: transcript
+                        }));
                     }
                 }
             } catch (err) {
@@ -920,12 +1063,10 @@ wss.on('connection', (ws, req) => {
 
         currentSession.dgSocket.on('error', (err) => {
             console.error(`Session ${currentSession.id}: Deepgram error:`, err);
-            // handleDeepgramReconnect(currentSession);
         });
 
         currentSession.dgSocket.on('close', () => {
             console.log(`Session ${currentSession.id}: Deepgram connection closed.`);
-            // handleDeepgramReconnect(currentSession);
         });
     };
 
@@ -1096,7 +1237,7 @@ wss.on('connection', (ws, req) => {
 
                 const userDetails = await functions.getUserDetailsByPhoneNo(session.caller);
                 // console.log(userDetails);
-                let announcementText = session.chatHistory[0].A; // Get initial message from chat history
+                let announcementText = session.chatHistory[0].content; // Get initial message from chat history
                 if (userDetails) {
                     announcementText = `Hello ${userDetails.name}, welcome to the Gautam Garments. How can I help you today?`;
                 }
