@@ -10,148 +10,28 @@ const twilio = require('twilio'); // This might not be directly used in the WebS
 const SHOPIFY_STORE_URL = process.env.SHOPIFY_STORE_URL;
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 const graphqlEndpoint = `https://${SHOPIFY_STORE_URL}/admin/api/2023-01/graphql.json`;
+const grpc = require('@grpc/grpc-js');
+const protoLoader = require('@grpc/proto-loader');
+
+const PROTO_PATH = './turn.proto';
+
+// Load proto file
+const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
+    keepCase: true,
+    longs: String,
+    enums: String,
+    defaults: true,
+    oneofs: true,
+});
+const turnProto = grpc.loadPackageDefinition(packageDefinition).turn;
+
+const turnDetector = new turnProto.TurnDetector(
+    'localhost:50051',
+    grpc.credentials.createInsecure()
+);
 
 
-const readline = require('readline');
 
-class ConversationTurnDetector {
-    constructor(pythonScriptPath = './turn.py') {
-        this.pythonScriptPath = pythonScriptPath;
-        this.pythonProcess = null;
-        this.isReady = false;
-        this.requestQueue = [];
-    }
-
-    async initialize() {
-        return new Promise((resolve, reject) => {
-            console.log('Initializing conversation turn detector...');
-
-            // Spawn Python process in interactive mode
-            this.pythonProcess = spawn("D:/work/ship-fast.studio/livekit turnDetector/temp/Scripts/python.exe", [this.pythonScriptPath], {
-                stdio: ['pipe', 'pipe', 'pipe']
-            });
-
-            // Listen for initialization completion
-            this.pythonProcess.stderr.on('data', (data) => {
-                const message = data.toString();
-                console.log('Python stderr:', message.trim());
-
-                if (message.includes('Conversation turn detector ready!')) {
-                    this.isReady = true;
-                    this.setupResponseHandler();
-                    resolve();
-                }
-            });
-
-            this.pythonProcess.on('error', (error) => {
-                console.error('Python process error:', error);
-                reject(error);
-            });
-
-            this.pythonProcess.on('close', (code) => {
-                console.log(`Python process exited with code ${code}`);
-                this.isReady = false;
-            });
-
-            // Timeout for initialization
-            setTimeout(() => {
-                if (!this.isReady) {
-                    reject(new Error('Turn detector initialization timeout'));
-                }
-            }, 120000); // 2 minute timeout for model loading
-        });
-    }
-
-    setupResponseHandler() {
-        const rl = readline.createInterface({
-            input: this.pythonProcess.stdout,
-            crlfDelay: Infinity
-        });
-
-        rl.on('line', (line) => {
-            this.handleResponse(line.trim());
-        });
-    }
-
-    handleResponse(response) {
-        if (this.requestQueue.length > 0) {
-            const { resolve } = this.requestQueue.shift();
-            const result = response === 'true';
-            resolve(result);
-        }
-    }
-
-    async detectTurnCompletion(messages) {
-        if (!this.isReady) {
-            throw new Error('Turn detector not initialized');
-        }
-
-        return new Promise((resolve, reject) => {
-            // Add to queue
-            this.requestQueue.push({ resolve, reject });
-
-            // Send messages as JSON to Python process
-            const messagesJson = JSON.stringify(messages);
-            this.pythonProcess.stdin.write(messagesJson + '\n');
-
-            // Timeout for individual requests
-            setTimeout(() => {
-                const index = this.requestQueue.findIndex(req => req.resolve === resolve);
-                if (index !== -1) {
-                    this.requestQueue.splice(index, 1);
-                    reject(new Error('Turn detection timeout'));
-                }
-            }, 10000); // 10 second timeout per request
-        });
-    }
-
-    destroy() {
-        if (this.pythonProcess) {
-            this.pythonProcess.stdin.write('exit\n');
-            this.pythonProcess.kill();
-            this.pythonProcess = null;
-            this.isReady = false;
-        }
-    }
-}
-
-class ConversationTurnService {
-    constructor() {
-        this.detector = null;
-        this.initialized = false;
-    }
-
-    async init() {
-        if (!this.initialized) {
-            this.detector = new ConversationTurnDetector('./turn.py');
-            await this.detector.initialize();
-            this.initialized = true;
-            console.log('Conversation Turn Detection Service ready!');
-        }
-    }
-
-    async isConversationComplete(messages) {
-        if (!this.initialized) {
-            await this.init();
-        }
-        return await this.detector.detectTurnCompletion(messages);
-    }
-
-    shutdown() {
-        if (this.detector) {
-            this.detector.destroy();
-            this.initialized = false;
-        }
-    }
-}
-
-const turnService = new ConversationTurnService();
-async function main() {
-    console.log('Initializing Conversation Turn Detection Service...');
-    await turnService.init(); // This will load the model
-    console.log('✅ Turn Detection Service is ready.');
-}
-main();
 
 const toolDefinitions = [
     {
@@ -1029,9 +909,9 @@ wss.on('connection', (ws, req) => {
                     console.log(`Session ${currentSession.id}: Received final segment. Current utterance: "${currentSession.currentUserUtterance}"`);
 
                     // 2. Prepare the conversation history for the turn detector.
-                    if(currentSession.chatHistory.length > 1){
+                    if (currentSession.chatHistory.length > 3) {
                         currentSession.chatHistory.shift()
-                        // currentSession.chatHistory.shift()
+                        currentSession.chatHistory.shift()
                     }
                     const messagesForDetection = [
                         ...currentSession.chatHistory,
@@ -1040,15 +920,34 @@ wss.on('connection', (ws, req) => {
                     console.log(messagesForDetection);
 
                     // 3. Ask the service if the turn is complete.
-                    const isComplete = await turnService.isConversationComplete(messagesForDetection);
+                    // const isComplete = await turnDetector.CheckEndOfTurn({ messages: messagesForDetection })
 
-                    if (isComplete) {
-                        // YES, the turn is complete. Process the full utterance.
-                        await handleTurnCompletion(currentSession);
-                    } else {
-                        // NO, the user just paused. Wait for them to continue.
-                        console.log(`Session ${currentSession.id}: ⏳ Turn NOT complete. Waiting for more input.`);
-                    }
+                    turnDetector.CheckEndOfTurn({ messages: messagesForDetection }, (err, response) => {
+                        (async () => {
+                            if (err) {
+                                console.error('❌ gRPC Error:', err);
+                            } else {
+                                if (response.end_of_turn) {
+                                    // YES, the turn is complete. Process the full utterance.
+                                    console.log("done")
+                                    await handleTurnCompletion(currentSession);
+                                } else {
+                                    // NO, the user just paused. Wait for them to continue.
+                                    console.log(`Session ${currentSession.id}: ⏳ Turn NOT complete. Waiting for more input.`);
+                                }
+                            }
+                        })();
+                    });
+
+
+
+                    // if (isComplete.end_of_turn) {
+                    //     // YES, the turn is complete. Process the full utterance.
+                    //     await handleTurnCompletion(currentSession);
+                    // } else {
+                    //     // NO, the user just paused. Wait for them to continue.
+                    //     console.log(`Session ${currentSession.id}: ⏳ Turn NOT complete. Waiting for more input.`);
+                    // }
 
                 } else { // This is an interim result.
                     // Interim logic remains the same - it's great for UI feedback.

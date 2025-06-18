@@ -1,0 +1,21 @@
+// turn.proto
+syntax = "proto3";
+
+package turn;
+
+service TurnDetector {
+  rpc CheckEndOfTurn (ChatHistory) returns (TurnResponse);
+}
+
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+}
+
+message ChatHistory {
+  repeated ChatMessage messages = 1;
+}
+
+message TurnResponse {
+  bool end_of_turn = 1;
+}

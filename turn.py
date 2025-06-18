@@ -23,7 +23,7 @@ class ConversationTurnDetector:
             print("Loading model (this may take a few minutes on first run)...", file=sys.stderr)
             self.model = AutoModelForCausalLM.from_pretrained(
                 checkpoint,
-                torch_dtype=torch.float16,
+                torch_dtype=torch.bfloat16,
                 low_cpu_mem_usage=True,
                 device_map="auto"
             )
@@ -149,18 +149,17 @@ class ConversationTurnDetector:
     def ai_analysis_with_context(self, conversation_context, last_message, last_role):
         """Use AI model for contextual turn detection"""
         try:
-            prompt = f"""Analyze this conversation to determine if the last speaker has finished their turn:
+            prompt = f"""Determine if the last message in this conversation means the {last_role} has finished speaking.
 
 CONVERSATION:
 {conversation_context}
 
-QUESTION: Has the {last_role} finished speaking their turn? Consider:
-- Is their last message a complete thought?
-- Are they asking a question that expects a response?
-- Are there signs they want to continue (incomplete sentences, trailing words)?
-- Does the context suggest they're done or still talking?
+Answer only:
+- "YES" if the {last_role}'s message is a complete thought or invites a response.
+- "NO" if it seems they want to continue (e.g., trailing words, incomplete sentence).
 
-Answer only "YES" if they're completely done speaking, or "NO" if they want to continue."""
+Answer:"""
+
 
             # Tokenize with proper attention mask
             inputs = self.tokenizer(
@@ -168,7 +167,6 @@ Answer only "YES" if they're completely done speaking, or "NO" if they want to c
                 return_tensors="pt", 
                 truncation=True, 
                 max_length=1024,
-                padding=True
             )
             
             with torch.no_grad():
