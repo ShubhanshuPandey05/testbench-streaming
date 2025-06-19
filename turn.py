@@ -2,7 +2,8 @@
 import sys
 import json
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import torch.nn.functional as F
 import warnings
 import os
 
@@ -11,96 +12,23 @@ warnings.filterwarnings("ignore")
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
+
 class ConversationTurnDetector:
     def __init__(self):
         try:
-            checkpoint = "HuggingFaceTB/SmolLM-1.7B-Instruct"
-            self.device = "cpu"
-            
+            checkpoint = "livekit/turn-detector"
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
             print("Loading tokenizer...", file=sys.stderr)
             self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-            
-            print("Loading model (this may take a few minutes on first run)...", file=sys.stderr)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                checkpoint,
-                torch_dtype=torch.bfloat16,
-                low_cpu_mem_usage=True,
-                device_map="auto"
-            )
-            
-            # Set pad token properly
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-                
+
+            print("Loading model...", file=sys.stderr)
+            self.model = AutoModelForSequenceClassification.from_pretrained(checkpoint).to(self.device)
+
             print("Model loaded successfully!", file=sys.stderr)
-                
         except Exception as e:
             print(json.dumps({"error": f"Model initialization failed: {str(e)}"}))
             sys.exit(1)
-    
-    def format_conversation(self, messages):
-        """Format messages array into conversation context"""
-        try:
-            if isinstance(messages, str):
-                # If it's a JSON string, parse it
-                messages = json.loads(messages)
-            
-            if not isinstance(messages, list) or len(messages) == 0:
-                return ""
-            
-            conversation = []
-            for msg in messages:
-                role = msg.get('role', 'user')
-                content = msg.get('content', '').strip()
-                
-                if content:
-                    if role == 'user':
-                        conversation.append(f"User: {content}")
-                    elif role == 'assistant':
-                        conversation.append(f"Assistant: {content}")
-                    else:
-                        conversation.append(f"{role}: {content}")
-            
-            return "\n".join(conversation)
-            
-        except Exception as e:
-            print(f"Error formatting conversation: {e}", file=sys.stderr)
-            return ""
-    
-    def analyze_conversation_context(self, messages):
-        """Analyze full conversation context for turn completion"""
-        conversation_text = self.format_conversation(messages)
-        
-        if not conversation_text:
-            return False
-        
-        # Get the last message
-        try:
-            if isinstance(messages, str):
-                messages = json.loads(messages)
-            
-            if not messages:
-                return False
-                
-            last_message = messages[-1]
-            last_content = last_message.get('content', '').strip()
-            last_role = last_message.get('role', 'user')
-            
-            # Quick linguistic analysis
-            linguistic_result = self.has_turn_markers(last_content, conversation_text)
-            
-            # For short messages or clear indicators, use linguistic analysis
-            if len(last_content.split()) < 5 or '?' in last_content:
-                return linguistic_result
-            
-            # Use AI analysis for complex cases
-            return self.ai_analysis_with_context(conversation_text, last_content, last_role)
-            
-        except Exception as e:
-            print(f"Error in context analysis: {e}", file=sys.stderr)
-            return False
-    
     def has_turn_markers(self, last_text, full_context=""):
         """Enhanced linguistic analysis with conversation context"""
         if not last_text or not last_text.strip():
@@ -146,102 +74,92 @@ class ConversationTurnDetector:
             
         return False
     
-    def ai_analysis_with_context(self, conversation_context, last_message, last_role):
-        """Use AI model for contextual turn detection"""
+    def format_conversation(self, messages):
+        """Join conversation turns with <|endoftext|>"""
         try:
-            prompt = f"""Determine if the last message in this conversation means the {last_role} has finished speaking.
+            if isinstance(messages, str):
+                messages = json.loads(messages)
 
-CONVERSATION:
-{conversation_context}
+            if not isinstance(messages, list) or len(messages) == 0:
+                return ""
 
-Answer only:
-- "YES" if the {last_role}'s message is a complete thought or invites a response.
-- "NO" if it seems they want to continue (e.g., trailing words, incomplete sentence).
+            turns = []
+            for msg in messages:
+                content = msg.get('content', '').strip()
+                if content:
+                    turns.append(content)
 
-Answer:"""
+            return "<|endoftext|>".join(turns)
+        except Exception as e:
+            print(f"Error formatting conversation: {e}", file=sys.stderr)
+            return ""
 
+    def detect_turn_completion(self, messages):
+        """Returns True if last user message is likely a turn end"""
+        try:
+            context = self.format_conversation(messages)
+            if not context:
+                return False
 
-            # Tokenize with proper attention mask
-            inputs = self.tokenizer(
-                prompt, 
-                return_tensors="pt", 
-                truncation=True, 
-                max_length=1024,
-            )
-            
+            inputs = self.tokenizer(context, return_tensors="pt", truncation=True, padding=True).to(self.device)
+
             with torch.no_grad():
-                outputs = self.model.generate(
-                    inputs['input_ids'],
-                    attention_mask=inputs['attention_mask'],
-                    max_new_tokens=3,
-                    temperature=0.1,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id
-                )
-            
-            response = self.tokenizer.decode(
-                outputs[0][len(inputs['input_ids'][0]):], 
-                skip_special_tokens=True
-            ).strip().upper()
-            
-            return "YES" in response
-            
+                logits = self.model(**inputs).logits
+                probs = F.softmax(logits, dim=-1)
+                yes_prob = probs[0][1].item()
+
+            print(f"Confidence: {yes_prob:.2f}", file=sys.stderr)
+            if yes_prob > 0.65:
+                return True
+            elif yes_prob < 0.35:
+                return False
+            else:
+                # Ambiguous? Use linguistic fallback
+                last_msg = messages[-1].get('content', '')
+                return self.has_turn_markers(last_msg)
+
         except Exception as e:
-            print(f"AI analysis failed: {e}", file=sys.stderr)
-            # Fallback to linguistic analysis
-            return self.has_turn_markers(last_message)
-    
-    def detect_turn_completion(self, messages_input):
-        """Main detection function - returns True if turn is complete"""
-        try:
-            return self.analyze_conversation_context(messages_input)
-        except Exception as e:
-            print(f"Turn detection error: {e}", file=sys.stderr)
+            print(f"Turn detection failed: {e}", file=sys.stderr)
             return False
+
 
 # Global detector instance
 detector = None
+
 
 def initialize_detector():
     global detector
     if detector is None:
         detector = ConversationTurnDetector()
 
+
 def main():
     try:
         initialize_detector()
-        print("Conversation turn detector ready!", file=sys.stderr)
-        
+        print("LiveKit Turn Detector ready!", file=sys.stderr)
+
         if len(sys.argv) > 1:
-            # Command line argument mode - expect JSON string
+            # Command-line input
             messages_json = sys.argv[1]
             result = detector.detect_turn_completion(messages_json)
             print("true" if result else "false")
         else:
-            # Interactive mode - read JSON from stdin
-            try:
-                for line in sys.stdin:
-                    line = line.strip()
-                    if not line:
-                        continue
-                        
-                    if line.lower() == 'exit':
-                        break
-                    
-                    # Expect JSON input
-                    result = detector.detect_turn_completion(line)
-                    print("true" if result else "false")
-                    sys.stdout.flush()
-                    
-            except KeyboardInterrupt:
-                pass
-            except Exception as e:
-                print(json.dumps({"error": str(e)}))
-                
+            # Interactive stdin input
+            for line in sys.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.lower() == 'exit':
+                    break
+
+                result = detector.detect_turn_completion(line)
+                print("true" if result else "false")
+                sys.stdout.flush()
+
     except Exception as e:
         print(json.dumps({"error": f"Initialization failed: {str(e)}"}))
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

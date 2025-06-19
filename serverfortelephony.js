@@ -483,6 +483,7 @@ The store name is "Gautam Garment"—refer to it by name in your responses when 
             vadDeepgramBuffer: Buffer.alloc(0), // Buffer for audio chunks after VAD/FFmpeg processing
             isVadSpeechActive: false,
             currentUserUtterance: '', // VAD's internal speech detection status
+            isTalking:false
         };
         this.sessions.set(sessionId, session);
         console.log(`Session ${sessionId}: Created new session.`);
@@ -702,7 +703,7 @@ const aiProcessing = {
 
         // Save the latest response ID for continuity
         session.lastResponseId = response.id;
-        console.log(response)
+        // console.log(response)
 
         if (response.output[0].type === "function_call") {
             const tool = []
@@ -720,7 +721,7 @@ const aiProcessing = {
                 toolResult = { error: "Unknown tool requested." };
             }
             // console.log(toolResult)
-            console.log(response.output)
+            // console.log(response.output)
 
             tool.push({
                 type: "function_call_output",
@@ -901,6 +902,7 @@ wss.on('connection', (ws, req) => {
                 // --- THIS IS THE CORE LOGIC CHANGE ---
                 if (received.is_final) {
                     // A segment of speech has ended. We now check if it completes the user's turn.
+                    currentSession.isTalking= true
                     currentSession.isSpeaking = false;
                     currentSession.lastInterimTranscript = '';
 
@@ -909,8 +911,7 @@ wss.on('connection', (ws, req) => {
                     console.log(`Session ${currentSession.id}: Received final segment. Current utterance: "${currentSession.currentUserUtterance}"`);
 
                     // 2. Prepare the conversation history for the turn detector.
-                    if (currentSession.chatHistory.length > 3) {
-                        currentSession.chatHistory.shift()
+                    if (currentSession.chatHistory.length > 8) {
                         currentSession.chatHistory.shift()
                     }
                     const messagesForDetection = [
@@ -934,12 +935,16 @@ wss.on('connection', (ws, req) => {
                                 } else {
                                     // NO, the user just paused. Wait for them to continue.
                                     console.log(`Session ${currentSession.id}: ⏳ Turn NOT complete. Waiting for more input.`);
+                                    isTalking = false
+                                    setTimeout(async () => {
+                                        if (!isTalking) {
+                                            await handleTurnCompletion(currentSession)
+                                        }
+                                    },2000)
                                 }
                             }
                         })();
                     });
-
-
 
                     // if (isComplete.end_of_turn) {
                     //     // YES, the turn is complete. Process the full utterance.
@@ -1096,8 +1101,6 @@ wss.on('connection', (ws, req) => {
                             const audioBuffer = Buffer.from(parsedVAD.chunk, 'hex');
                             session.vadDeepgramBuffer = Buffer.concat([session.vadDeepgramBuffer, audioBuffer]);
 
-                            // Send to Deepgram immediately if speech is active and Deepgram is open,
-                            // OR if the buffer reaches a small threshold.
                             // The key is to send frequently, not wait for a large chunk.
                             if (session.isVadSpeechActive && session.dgSocket?.readyState === WebSocket.OPEN) {
                                 while (session.vadDeepgramBuffer.length >= CONFIG.DEEPGRAM_STREAM_CHUNK_SIZE) {
