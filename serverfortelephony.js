@@ -151,70 +151,70 @@ const functions = {
         return products;
     },
 
-    // async getUserDetailsByPhoneNo(phone) {
-    //     const query = `
-    //     {
-    //       customers(first: 1, query: "phone:${phone}") {
-    //         edges {
-    //           node {
-    //             id
-    //             firstName
-    //             lastName
-    //             email
-    //             phone
-    //             numberOfOrders
-    //           }
-    //         }
-    //       }
-    //     }
-    //     `;
-
-    //     const response = await fetch(graphqlEndpoint, {
-    //         method: 'POST',
-    //         headers: {
-    //             'Content-Type': 'application/json',
-    //             'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
-    //         },
-    //         body: JSON.stringify({ query }),
-    //     });
-
-    //     const data = await response.json();
-    //     if (!data.data || !data.data.customers.edges.length) return null;
-
-    //     const user = data.data.customers.edges[0].node;
-    //     return {
-    //         id: user.id,
-    //         firstName: user.firstName,
-    //         lastName: user.lastName,
-    //         email: user.email,
-    //         phone: user.phone,
-    //         ordersCount: user.ordersCount
-    //     };
-    // },
-
     async getUserDetailsByPhoneNo(phone) {
-        try {
-            // console.log(`http://localhost:3000/getuser/search?${encodeURIComponent(phone)}`)
-            const response = await fetch(`http://localhost:3000/getuser/search?phone=${encodeURIComponent(phone)}`);
-
-            if (!response.ok) {
-                console.error('User not found or error occurred:', response.status);
-                return null;
+        const query = `
+        {
+          customers(first: 1, query: "phone:${phone}") {
+            edges {
+              node {
+                id
+                firstName
+                lastName
+                email
+                phone
+                numberOfOrders
+              }
             }
-
-            const user = await response.json();
-            console.log(user[0].name)
-            return {
-                id: user[0].user_id,
-                name: user[0].name,
-                email: user[0].email,
-                phone: user[0].phone,// Optional, if you have this in DB
-            };
-        } catch (error) {
-            console.error('❌ Error fetching user by phone from API:', error);
-            return null;
+          }
         }
+        `;
+
+        const response = await fetch(graphqlEndpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+            },
+            body: JSON.stringify({ query }),
+        });
+
+        const data = await response.json();
+        if (!data.data || !data.data.customers.edges.length) return null;
+
+        const user = data.data.customers.edges[0].node;
+        return {
+            id: user.id,
+            firstName: user.firstName,
+            lastName: user.lastName,
+            email: user.email,
+            phone: user.phone,
+            ordersCount: user.ordersCount
+        };
     },
+
+    // async getUserDetailsByPhoneNo(phone) {
+    //     try {
+    //         // console.log(`http://localhost:3000/getuser/search?${encodeURIComponent(phone)}`)
+    //         const response = await fetch(`http://localhost:3000/getuser/search?phone=${encodeURIComponent(phone)}`);
+
+    //         if (!response.ok) {
+    //             console.error('User not found or error occurred:', response.status);
+    //             return null;
+    //         }
+
+    //         const user = await response.json();
+    //         console.log(user[0].name)
+    //         return {
+    //             id: user[0].user_id,
+    //             name: user[0].name,
+    //             email: user[0].email,
+    //             phone: user[0].phone,// Optional, if you have this in DB
+    //         };
+    //     } catch (error) {
+    //         console.error('❌ Error fetching user by phone from API:', error);
+    //         return null;
+    //     }
+    // },
 
     async getAllOrders(cursor = null) {
         const query = `
@@ -1146,7 +1146,7 @@ wss.on('connection', (ws, req) => {
                 // console.log(userDetails);
                 let announcementText = session.chatHistory[0].content; // Get initial message from chat history
                 if (userDetails) {
-                    announcementText = `Hello ${userDetails.name}, welcome to the Gautam Garments. How can I help you today?`;
+                    announcementText = `Hello ${userDetails.firstName}, welcome to the Gautam Garments. How can I help you today?`;
                 }
 
                 const mp3Buffer = await aiProcessing.synthesizeSpeech(announcementText, session.id);
