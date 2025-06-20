@@ -483,7 +483,7 @@ The store name is "Gautam Garment"—refer to it by name in your responses when 
             vadDeepgramBuffer: Buffer.alloc(0), // Buffer for audio chunks after VAD/FFmpeg processing
             isVadSpeechActive: false,
             currentUserUtterance: '', // VAD's internal speech detection status
-            isTalking:false
+            isTalking: false
         };
         this.sessions.set(sessionId, session);
         console.log(`Session ${sessionId}: Created new session.`);
@@ -902,7 +902,7 @@ wss.on('connection', (ws, req) => {
                 // --- THIS IS THE CORE LOGIC CHANGE ---
                 if (received.is_final) {
                     // A segment of speech has ended. We now check if it completes the user's turn.
-                    currentSession.isTalking= true
+                    currentSession.isTalking = true
                     currentSession.isSpeaking = false;
                     currentSession.lastInterimTranscript = '';
 
@@ -930,17 +930,20 @@ wss.on('connection', (ws, req) => {
                             } else {
                                 if (response.end_of_turn) {
                                     // YES, the turn is complete. Process the full utterance.
-                                    console.log("done")
-                                    await handleTurnCompletion(currentSession);
+                                    console.log(`Session ${currentSession.id}: ⏳ Turn NOT complete. Waiting for more input.`);
+                                    if (!currentSession.isVadSpeechActive) {
+                                        await handleTurnCompletion(currentSession);
+
+                                    }
                                 } else {
                                     // NO, the user just paused. Wait for them to continue.
                                     console.log(`Session ${currentSession.id}: ⏳ Turn NOT complete. Waiting for more input.`);
-                                    isTalking = false
+                                    currentSession.isTalking = false
                                     setTimeout(async () => {
-                                        if (!isTalking) {
+                                        if (!currentSession.isTalking && !currentSession.isVadSpeechActive) {
                                             await handleTurnCompletion(currentSession)
                                         }
-                                    },5000)
+                                    }, 5000)
                                 }
                             }
                         })();
