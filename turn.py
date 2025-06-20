@@ -38,16 +38,18 @@ class ConversationTurnDetector:
             if not isinstance(messages, list) or len(messages) == 0:
                 return ""
 
-            turns = []
+            formatted = []
             for msg in messages:
+                role = msg.get('role', '').strip()
                 content = msg.get('content', '').strip()
-                if content:
-                    turns.append(content)
+                if role and content:
+                    formatted.append(f"<|im_start|>{role}\n{content}<|im_end|>")
 
-            return "<|endoftext|>".join(turns)
+            return "\n".join(formatted)
         except Exception as e:
             print(f"Error formatting conversation: {e}", file=sys.stderr, flush=True)
             return ""
+
 
     def detect_turn_completion(self, messages):
         try:
