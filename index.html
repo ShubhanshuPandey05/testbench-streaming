@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Call Service</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      font-family: 'Segoe UI', sans-serif;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: linear-gradient(135deg, #74ebd5, #9face6);
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .container {
+      background-color: white;
+      padding: 2rem 3rem;
+      border-radius: 16px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+      width: 90%;
+      max-width: 400px;
+      text-align: center;
+    }
+
+    h2 {
+      margin-bottom: 1.5rem;
+      color: #333;
+    }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 0.75rem;
+      margin-bottom: 1rem;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      font-size: 1rem;
+      transition: border-color 0.3s;
+    }
+
+    input[type="text"]:focus {
+      border-color: #7a5cfa;
+      outline: none;
+    }
+
+    button {
+      background-color: #7a5cfa;
+      color: white;
+      border: none;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 1rem;
+      transition: background-color 0.3s;
+    }
+
+    button:hover {
+      background-color: #684ae0;
+    }
+
+    .message {
+      margin-top: 1rem;
+      font-size: 0.95rem;
+      color: green;
+    }
+
+    .loading {
+      opacity: 0.7;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Make a Call</h2>
+    <form id="callForm">
+      <input type="text" name="to" id="to" placeholder="Phone with country code eg: +91" required />
+      <button type="submit" id="submitBtn">Submit</button>
+      <div class="message" id="message"></div>
+    </form>
+  </div>
+
+  <script>
+    const form = document.getElementById('callForm');
+    const btn = document.getElementById('submitBtn');
+    const message = document.getElementById('message');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const toValue = document.getElementById('to').value.trim();
+
+      if (!toValue) {
+        message.textContent = "Please enter a number.";
+        return;
+      }
+
+      btn.textContent = "Calling...";
+      btn.classList.add("loading");
+
+      try {
+        const res = await fetch("https://temp-vb4k.onrender.com/call", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: `to=${encodeURIComponent(toValue)}`
+        });
+
+        const text = await res.text();
+        message.textContent = res.ok ? "Call initiated successfully!" : `Error: ${text}`;
+      } catch (err) {
+        message.textContent = "Request failed. Check your internet or server.";
+      }
+
+      btn.textContent = "Submit";
+      btn.classList.remove("loading");
+    });
+  </script>
+</body>
+</html>

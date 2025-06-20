@@ -818,7 +818,7 @@ wss.on('connection', (ws, req) => {
         const finalTranscript = session.currentUserUtterance;
         if (!finalTranscript) return; // Do nothing if there's no transcript
 
-        console.log(`Session ${session.id}: Turn complete. Processing final transcript: "${finalTranscript}"`);
+        // console.log(`Session ${session.id}: Turn complete. Processing final transcript: "${finalTranscript}"`);
 
         // 1. Add the complete user message to the official chat history
         session.chatHistory.push({ role: 'user', content: finalTranscript });
@@ -884,7 +884,7 @@ wss.on('connection', (ws, req) => {
         }
 
         currentSession.dgSocket = new WebSocket(
-            `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-3&language=en&punctuate=true&interim_results=true&endpointing=50`,
+            `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-3&language=en&punctuate=true&interim_results=true&endpointing=100`,
             ['token', `${process.env.DEEPGRAM_API}`]
         );
 
@@ -940,7 +940,7 @@ wss.on('connection', (ws, req) => {
                                         if (!isTalking) {
                                             await handleTurnCompletion(currentSession)
                                         }
-                                    },2000)
+                                    },5000)
                                 }
                             }
                         })();
