@@ -1,7 +1,7 @@
 import math
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Tuple
 
 class ConversationTurnDetector:
     HF_MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
@@ -60,7 +60,7 @@ class ConversationTurnDetector:
 
         return top_logprobs_dict
 
-    def process_result(self, top_logprobs: Dict[str, float], target_tokens: List[str] = ["<|im_end|>"]) -> tuple[float, str]:
+    def process_result(self, top_logprobs: Dict[str, float], target_tokens: List[str] = ["<|im_end|>"]) -> Tuple[float, str]:
         """
         Extracts the max probability among the specified target tokens.
         """
