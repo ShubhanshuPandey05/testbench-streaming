@@ -1,7 +1,7 @@
 import math
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from typing import Any
+from typing import Any, List, Dict
 
 class ConversationTurnDetector:
     HF_MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
@@ -15,7 +15,7 @@ class ConversationTurnDetector:
         self.model.to("cpu")
         self.model.eval()
 
-    def _convert_messages_to_chatml(self, messages: list[dict[str, Any]]) -> str:
+    def _convert_messages_to_chatml(self, messages: List[Dict[str, Any]]) -> str:
         """
         Converts a list of messages into a single string in ChatML format.
         Removes the EOT token from the last message so the model can predict it.
@@ -36,7 +36,7 @@ class ConversationTurnDetector:
             return tokenized_convo[:last_eot_index]
         return tokenized_convo
 
-    def get_next_token_logprobs(self, prompt_text: str) -> dict[str, float]:
+    def get_next_token_logprobs(self, prompt_text: str) -> Dict[str, float]:
         """
         Performs local inference to get log probabilities for the next token.
         """
@@ -60,7 +60,7 @@ class ConversationTurnDetector:
 
         return top_logprobs_dict
 
-    def process_result(self, top_logprobs: dict[str, float], target_tokens: list[str] = ["<|im_end|>"]) -> tuple[float, str]:
+    def process_result(self, top_logprobs: Dict[str, float], target_tokens: List[str] = ["<|im_end|>"]) -> tuple[float, str]:
         """
         Extracts the max probability among the specified target tokens.
         """
@@ -77,7 +77,7 @@ class ConversationTurnDetector:
 
         return max_prob, best_token
 
-    def predict_eot_prob(self, messages: list[dict[str, Any]]) -> float:
+    def predict_eot_prob(self, messages: List[Dict[str, Any]]) -> float:
         """
         Predicts the probability that the current turn is complete.
         """
@@ -90,7 +90,7 @@ class ConversationTurnDetector:
         print(f"EOT Probability: {eot_prob:.4f}")
         return eot_prob
     
-    def detect_turn_completion(self, messages: list[dict[str, Any]]) -> bool:
+    def detect_turn_completion(self, messages: List[Dict[str, Any]]) -> bool:
         """
         Returns True if end-of-turn probability exceeds threshold.
         """
