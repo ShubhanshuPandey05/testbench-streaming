@@ -930,7 +930,7 @@ wss.on('connection', (ws, req) => {
                             } else {
                                 if (response.end_of_turn) {
                                     // YES, the turn is complete. Process the full utterance.
-                                    console.log(`Session ${currentSession.id}: ⏳ Turn NOT complete. Waiting for more input.`);
+                                    console.log(`Session ${currentSession.id}: ✅ Turn complete. Waiting for more input.`);
                                     if (!currentSession.isVadSpeechActive) {
                                         await handleTurnCompletion(currentSession);
 
